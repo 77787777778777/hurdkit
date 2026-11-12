@@ -9,6 +9,9 @@
 #   3. Check the provision marker; if absent, run apt update/upgrade
 #   4. Power off
 #
+# The SSH session itself is driven by scripts/provision_guest.py, which
+# does the login, the commands and the poweroff.
+#
 # A marker file at /root/.provisioned makes the script idempotent.
 #
 # The provisioning runs on a private copy of the base image. Only a
@@ -35,8 +38,8 @@ MEMORY="${MEMORY:-2G}"
 
 # The package upgrade is off by default. The sid archive currently ships a
 # hurd-dev that cannot be unpacked on Hurd (see the hurd-dev comment in
-# the expect block below), and a usable image does not need the upgrade.
-# Set RUN_APT_UPGRADE=1 to enable it again.
+# scripts/provision_guest.py), and a usable image does not need the
+# upgrade. Set RUN_APT_UPGRADE=1 to enable it again.
 RUN_APT_UPGRADE="${RUN_APT_UPGRADE:-0}"
 
 if [[ ! -f "$BASE_IMG" ]]; then
@@ -44,8 +47,13 @@ if [[ ! -f "$BASE_IMG" ]]; then
     exit 1
 fi
 
-if ! command -v expect >/dev/null 2>&1; then
-    echo "expect is required for provisioning" >&2
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "python3 is required for provisioning" >&2
+    exit 1
+fi
+
+if ! python3 -c "import pexpect" >/dev/null 2>&1; then
+    echo "The python module pexpect is required for provisioning" >&2
     exit 1
 fi
 
@@ -126,160 +134,16 @@ fi
 # The forwarded port accepts connections as soon as QEMU is running, but
 # sshd in the guest only listens a little later. The login is therefore
 # retried until the guest is ready.
+#
+# The exit status of the driver tells the two failures apart: 1 means that
+# the session could not be established and that a retry may work, 2 means
+# that a command failed in the guest and that the same guest cannot fix
+# that.
 SSH_RC=0
 for attempt in $(seq 1 12); do
     if SSH_HOST="$SSH_HOST" SSH_PORT="$SSH_PORT" ROOT_PASSWORD="$ROOT_PASSWORD" \
     RUN_APT_UPGRADE="$RUN_APT_UPGRADE" \
-    expect - <<'EXPECT'
-set ssh_host $env(SSH_HOST)
-set ssh_port $env(SSH_PORT)
-set password $env(ROOT_PASSWORD)
-
-# The login phase has its own short timeout: the forwarded port accepts
-# connections before sshd in the guest is ready, and a connection that is
-# reset in the meantime would otherwise block for the whole session
-# timeout instead of being retried.
-#
-# Exit codes of this script:
-#   1 - the session could not be established (retryable)
-#   2 - a command failed (not retryable, the guest needs a fresh start)
-set timeout 120
-
-spawn ssh \
-    -o StrictHostKeyChecking=no \
-    -o UserKnownHostsFile=/dev/null \
-    -o PreferredAuthentications=password \
-    -o PubkeyAuthentication=no \
-    -p $ssh_port root@$ssh_host
-
-expect {
-    -re "(?i)password:" { send "$password\r" }
-    eof { puts "Connection closed before the password prompt"; exit 1 }
-    timeout { puts "TIMEOUT waiting for password prompt"; exit 1 }
-}
-
-# The root shell prompt ends with "# ". A repeated password prompt means
-# that the login was rejected.
-expect {
-    -re {# $} { }
-    -re "(?i)password:" { puts "The login was rejected"; exit 1 }
-    eof { puts "Connection closed during the login"; exit 1 }
-    timeout { puts "TIMEOUT waiting for shell prompt"; exit 1 }
-}
-# The provisioning commands take minutes, so they get a long timeout.
-set timeout 3600
-
-# Stop echoing the command lines so that markers cannot match their own
-# echo; the shell prompt is the only reliable synchronisation point.
-send "stty -echo\r"
-expect {
-    -re {# $} { }
-    timeout { puts "TIMEOUT disabling terminal echo"; exit 1 }
-}
-
-# Run a command, capture its exit status and its output, and return the
-# exit status. The output is left in the guest's /tmp for inspection.
-proc run_command {cmd tag} {
-    set logfile "/tmp/provision_${tag}.log"
-    send "$cmd >$logfile 2>&1; rc=\$?; echo \"__RC__\${rc}__\"\r"
-    expect {
-        -re {__RC__(-?[0-9]+)__} { set rc $expect_out(1,string) }
-        eof { puts "Connection closed while running: $cmd"; exit 1 }
-        timeout { puts "TIMEOUT running: $cmd"; exit 1 }
-    }
-    expect {
-        -re {# $} { }
-        eof { puts "Connection closed while running: $cmd"; exit 1 }
-        timeout { puts "TIMEOUT waiting for prompt after: $cmd"; exit 1 }
-    }
-    return $rc
-}
-
-# The image ships with an "unreleased" suite enabled. The packages of that
-# suite are not stable, so it is removed before any package is fetched.
-puts "Disabling the unreleased suite..."
-run_command {sed -i '/unreleased/d' /etc/apt/sources.list} sources_prune
-run_command {for f in /etc/apt/sources.list.d/*.list; do [ -e "$f" ] && sed -i '/unreleased/d' "$f"; done; true} sources_prune_d
-set rc [run_command {if [ -d /etc/apt/sources.list.d ]; then grep -rqs unreleased /etc/apt/sources.list /etc/apt/sources.list.d; else grep -qs unreleased /etc/apt/sources.list; fi} sources_check]
-if { $rc == 0 } {
-    puts "The unreleased suite is still enabled in the apt sources"
-    exit 2
-}
-
-# The hurd-dev package from sid cannot be unpacked on Hurd: dpkg fails
-# with "unable to install new version of .../linux-headers/linux/hdlc",
-# because the new version wants to replace a directory with a file. The
-# package is held at the installed version and pinned below zero, so that
-# an upgrade cannot select the broken version.
-puts "Holding hurd-dev..."
-run_command {apt-mark hold hurd-dev} hurd_dev_hold
-run_command {mkdir -p /etc/apt/preferences.d && echo 'Package: hurd-dev' > /etc/apt/preferences.d/99-hurd-dev && echo 'Pin: release *' >> /etc/apt/preferences.d/99-hurd-dev && echo 'Pin-Priority: -1' >> /etc/apt/preferences.d/99-hurd-dev} hurd_dev_pin
-
-# The package upgrade is off by default: the sid archive currently ships a
-# hurd-dev that cannot be unpacked on Hurd, and a usable image does not
-# need the upgrade. Set RUN_APT_UPGRADE=1 to enable it again.
-set run_apt 0
-if {[info exists env(RUN_APT_UPGRADE)] && $env(RUN_APT_UPGRADE) eq "1"} {
-    set run_apt 1
-}
-
-# Check if already provisioned. The exit status of the test is the result,
-# so no marker text has to be matched at all.
-set rc [run_command "test -f /root/.provisioned" marker]
-if { $rc == 0 } {
-    puts "Image is already provisioned."
-} else {
-    if { $run_apt } {
-        # Run setup commands from the Hurd image instructions.
-        #
-        # The downloaded .deb files stay in the package cache, which needs
-        # around 180 MB; the guest filesystem has enough room for that.
-        set apt_opts "-o APT::Install-Recommends=false"
-        puts "Running apt update..."
-        set rc [run_command "DEBIAN_FRONTEND=noninteractive apt-get $apt_opts update" apt_update]
-        if { $rc != 0 } {
-            puts "apt-get update failed with status $rc"
-            exit 2
-        }
-        puts "Running apt upgrade..."
-        set rc [run_command "DEBIAN_FRONTEND=noninteractive apt-get $apt_opts -y -o Dpkg::Options::=--force-confold upgrade" apt_upgrade]
-        if { $rc != 0 } {
-            puts "apt-get upgrade failed with status $rc"
-            puts "The output of the failed command is in /tmp/provision_apt_upgrade.log in the guest"
-            # A failed upgrade leaves dpkg in an inconsistent state. Repairing
-            # it in the guest is worth one attempt, but a second failure needs
-            # a fresh guest: the ext2 filesystem of the image has no journal
-            # and does not survive a failed unpack.
-            run_command "dpkg --configure -a" dpkg_configure
-            set rc [run_command "apt-get -f -y install" apt_fix]
-            if { $rc != 0 } {
-                puts "apt-get -f install failed with status $rc"
-                exit 2
-            }
-        }
-        # Reclaim the space taken by the downloaded packages
-        run_command "apt-get clean" apt_clean
-    } else {
-        puts "Skipping apt update and apt upgrade (RUN_APT_UPGRADE is not set)."
-    }
-    # Write the provision marker
-    run_command "touch /root/.provisioned" marker_write
-}
-
-# Power the guest off. The SSH connection dies together with the guest, so
-# neither the exit status nor the shell prompt can be waited for reliably.
-send "poweroff\r"
-expect {
-    -re {__RC__(-?[0-9]+)__} { }
-    eof { }
-    timeout { puts "TIMEOUT waiting for poweroff"; exit 1 }
-}
-# The connection is closed when the guest is gone. The end of the file may
-# already have been seen above, in which case there is nothing left to wait
-# for and expect would fail on the closed spawn.
-catch { expect eof }
-EXPECT
-    then
+    python3 "$SCRIPT_DIR/provision_guest.py"; then
         SSH_RC=0
         break
     else
@@ -329,11 +193,11 @@ fi
 wait "$QEMU_PID" 2>/dev/null || true
 QEMU_PID=""
 
-# Repair the filesystem of the provisioned copy. The guest ran apt-get
-# upgrade, which created and removed thousands of files; without a journal
-# the shutdown leaves stale inode and block bitmaps behind. The repair runs
-# on the image itself: qemu-nbd serves it, nbdfuse exposes it as a file and
-# partitionfs exposes the partition, so no conversion is needed.
+# Repair the filesystem of the provisioned copy. The guest wrote to the
+# filesystem, and without a journal the shutdown leaves stale inode and
+# block bitmaps behind. The repair runs on the image itself: qemu-nbd
+# serves it, nbdfuse exposes it as a file and partitionfs exposes the
+# partition, so no conversion is needed.
 bash "$SCRIPT_DIR/repair_filesystem.sh" "$WORK_IMG"
 
 # Replace the base image with the provisioned copy.

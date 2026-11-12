@@ -15,7 +15,8 @@ Use this skill whenever work touches the Hurd disk image or its boot path:
 
 - `Makefile` - pipeline definition and all tunables (version, URL, MD5, ports, password).
 - `scripts/prepare_base.sh` - offline changes applied to a copy of the raw image.
-- `scripts/provision_base.sh` - in-VM provisioning driven over SSH.
+- `scripts/provision_base.sh` - boots the guest and runs the provisioning.
+- `scripts/provision_guest.py` - drives the guest over SSH (login, commands, poweroff).
 - `scripts/repair_filesystem.sh` - offline ext2 repair of the provisioned image.
 - `img/debian-hurd-amd64-<VERSION>.img.tar.xz` - the downloaded Debian GNU/Hurd image
   (pinned to `VERSION=20260314`, MD5 `91dc71608fcfc9f237028f1fe87c39c2`).
@@ -43,8 +44,9 @@ The acceptance criteria for a finished image are:
 ## Environment (this sandbox)
 
 - Tools available: `qemu-img` / `qemu-system-x86_64` 10.2.3, `wget`, `tar`, `xz`,
-  `expect`, `ssh`, `md5sum`, `debugfs` 1.47.4, `dumpe2fs`, `e2fsck`, `sfdisk`,
-  `parted`, `fuse2fs`, `fusermount`, `openssl`, `flock`, `jq`, `python3`.
+  `python3` 3.14 with the module `pexpect` 4.9, `ssh`, `md5sum`, `debugfs` 1.47.4,
+  `dumpe2fs`, `e2fsck`, `sfdisk`, `parted`, `fuse2fs`, `fusermount`, `openssl`,
+  `flock`, `jq`.
 - Tool **not** available: `sudo`, `nbd`, `guestfish`, `virt-customize`, `socat`,
   `sshpass`. There is no root access, so loop mounts and libguestfs are out; the
   offline write path is `partitionfs` + `debugfs`.
@@ -140,21 +142,22 @@ base image and only replaces the base when everything succeeded:
 2. Boot that copy with QEMU (`if=ide`, `-device e1000`, user networking with
    `hostfwd` of the SSH port to port 22 of the guest).
 3. Wait until the forwarded port accepts connections (sshd starts during boot).
-4. Drive the guest with `expect` over SSH (the login is retried, see pitfall 19):
+4. Drive the guest over SSH with `scripts/provision_guest.py` (the login is
+   retried, see pitfall 19):
    - log in as `root` with the password that was set offline,
    - `stty -echo` so that the echoed command line cannot be mistaken for
      command output,
    - `run_command <cmd> <tag>` sends a command, captures its exit status through
      a `__RC__<n>__` marker and leaves the output in the guest's
      `/tmp/provision_<tag>.log`,
-   - remove the "unreleased" suite from the apt sources of the guest and
-     hold the `hurd-dev` package (see pitfalls 29 and 30),
+   - remove the "unreleased" suite from the apt sources and hold `hurd-dev`
+     (see pitfalls 29 and 30),
    - if `/root/.provisioned` exists, stop here ("Image is already provisioned."),
    - otherwise run `apt-get update` and `apt-get upgrade` **only** when
      `RUN_APT_UPGRADE=1` is set, and create the marker,
-   - `poweroff` the guest and wait for QEMU to exit. The SSH connection dies
-     together with the guest, so the script does not wait for the exit status
-     or the shell prompt of the poweroff command.
+   - `poweroff` the guest and wait for the SSH connection to end. The SSH
+     connection dies together with the guest, so the script does not wait for
+     the exit status or the shell prompt of the poweroff command.
 5. Repair the ext2 filesystem offline (`scripts/repair_filesystem.sh`), see below.
 6. `mv -f` the provisioned copy over `img/hurd.base.qcow2`.
 
@@ -260,7 +263,7 @@ Every one of these was hit while building this pipeline.
    `partitionfs` (which exposes the partition as a plain file) plus
    `debugfs -w` on that file.
 
-7. **expect matches the wrong branch.** `NOT_PROVISIONED` contains the
+7. **The driver matches the wrong branch.** `NOT_PROVISIONED` contains the
    substring `PROVISIONED`, and the guest echoes the command line, which
    contains the marker text. Fix: never match on marker text; use the exit
    status of the command and disable the terminal echo with `stty -echo`.
@@ -357,17 +360,16 @@ Every one of these was hit while building this pipeline.
     the image instead of replacing it.
 
 25. **The SSH connection dies together with the guest.** After `poweroff` the
-    connection is closed, so expect cannot wait for the exit status or for
-    the end of the file a second time; it fails with "spawn id exp3 not
-    open" and the provisioning is aborted even though the guest did all the
-    work. Fix: wait for the end of the file once and ignore the error when
-    the spawn is already closed (`catch { expect eof }`).
+    connection is closed, so the driver cannot wait for the exit status or for
+    the end of the file a second time; the provisioning is aborted even though
+    the guest did all the work. Fix: wait for the end of the file once and
+    ignore the error when the connection is already closed.
 
 26. **`$?` after `fi` is the status of the `if` statement, not of the failed
     command.** The retry loop of the provisioning used
 
     ```bash
-    if expect ...; then SSH_RC=0; break; fi
+    if python3 scripts/provision_guest.py; then SSH_RC=0; break; fi
     SSH_RC=$?
     ```
 
@@ -377,11 +379,11 @@ Every one of these was hit while building this pipeline.
     forever in `wait "$QEMU_PID"`, because the guest was still running. This
     is what made a failed provisioning look like a dead, hanging QEMU job.
     Fix: read the status inside the `else` branch, where it is still the
-    status of the condition. The expect script uses the exit status 2 for a
+    status of the condition. The driver uses the exit status 2 for a
     command that failed in the guest; that case is not retried, because the
     same guest cannot fix it.
 
-27. **A long expect timeout hides a failed login.** The whole session had one
+27. **A long timeout hides a failed login.** The whole session had one
     timeout of 3600 seconds, so a connection that was reset because sshd was
     not up yet blocked for an hour instead of being retried. Fix: a short
     timeout (120 s) for the login phase, a long one for the commands, and an
@@ -423,6 +425,14 @@ Every one of these was hit while building this pipeline.
     The packages of the "unreleased" suite are not stable. Fix: remove the
     suite from the sources of the guest before `apt-get update` and verify
     that no source mentions "unreleased" any more.
+
+31. **A guest that is still booting can miss the poweroff.** The first
+    provisioning attempt after a fresh boot sent the poweroff while the
+    guest was still starting up; the connection then stayed open for an
+    hour. Fix: wait a bounded time (60 s) for the connection to end, send
+    the request again, and fail with a clear error after the second try.
+    The provisioning script waits for QEMU to exit anyway and terminates it
+    when the guest does not shut down.
 
 ## Known issue: ext2 without a journal
 
@@ -480,14 +490,14 @@ outside `/etc` (the defaults are taken from the file being replaced).
 
 ### Add or change in-VM provisioning steps
 
-Edit the `expect` block in `scripts/provision_base.sh` and add a `run_command`
-call with a **unique** tag; the tag names the log file in the guest
+Edit `scripts/provision_guest.py` and add a `run_command` call with a
+**unique** tag; the tag names the log file in the guest
 (`/tmp/provision_<tag>.log`). `run_command` returns the exit status of the
 command, so check it and fail the provisioning when it fails.
 
 Steps that must run before the marker is written belong above
-`run_command "touch /root/.provisioned" marker_write`; steps that must run on
-every boot belong below it.
+`session.run_command("touch /root/.provisioned", "marker_write")`; steps that
+must run on every boot belong below it.
 
 ### Change the SSH port or the network device
 
@@ -538,12 +548,13 @@ md5sum img/hurd.base.qcow2        # must be identical
 ```
 
 Check the SSH login from the host (no `sshpass` on this machine, so use
-`expect`):
+`pexpect`):
 
 ```
-expect -c 'spawn ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-    -o PreferredAuthentications=password -o PubkeyAuthentication=no \
-    -p 2222 root@127.0.0.1 id; expect "password:"; send "abcdef\r"; expect eof'
+python3 -c 'import pexpect; c = pexpect.spawn("ssh", ["-o", "StrictHostKeyChecking=no",
+    "-o", "UserKnownHostsFile=/dev/null", "-o", "PreferredAuthentications=password",
+    "-o", "PubkeyAuthentication=no", "-p", "2222", "root@127.0.0.1", "id"], encoding="utf-8");
+    c.expect("password:"); c.sendline("abcdef"); c.expect(pexpect.EOF); print(c.before)'
 ```
 
 ## Constraints
