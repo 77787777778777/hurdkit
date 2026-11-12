@@ -68,6 +68,11 @@ BASE_DIR="$(dirname "$BASE_IMG")"
 # The working copy lives next to the base image so that replacing the base
 # image is a rename within the same filesystem.
 WORK_IMG="$(mktemp -p "$BASE_DIR" .provision.XXXXXX.qcow2)"
+# The SSH keys of the guest accounts live next to the base image. They are
+# private keys, so the directory is only readable by the owner.
+SSH_KEY_DIR="${SSH_KEY_DIR:-$BASE_DIR/keys}"
+mkdir -p "$SSH_KEY_DIR"
+chmod 700 "$SSH_KEY_DIR"
 QEMU_LOG="$(mktemp)"
 QEMU_PID=""
 cleanup() {
@@ -148,6 +153,7 @@ for attempt in $(seq 1 12); do
     if SSH_HOST="$SSH_HOST" SSH_PORT="$SSH_PORT" ROOT_PASSWORD="$ROOT_PASSWORD" \
     RUN_APT_UPGRADE="$RUN_APT_UPGRADE" \
     GUEST_PACKAGES="$GUEST_PACKAGES" \
+    SSH_KEY_DIR="$SSH_KEY_DIR" \
     python3 "$SCRIPT_DIR/provision_guest.py"; then
         SSH_RC=0
         break

@@ -18,6 +18,7 @@ Use this skill whenever work touches the Hurd disk image or its boot path:
 - `scripts/provision_base.sh` - boots the guest and runs the provisioning.
 - `scripts/provision_guest.py` - drives the guest over SSH (login, commands, poweroff).
 - `scripts/repair_filesystem.sh` - offline ext2 repair of the provisioned image.
+- `img/keys/` - the SSH keys of the guest accounts (private keys, not in git).
 - `img/debian-hurd-amd64-<VERSION>.img.tar.xz` - the downloaded Debian GNU/Hurd image
   (pinned to `VERSION=20260314`, MD5 `91dc71608fcfc9f237028f1fe87c39c2`).
 
@@ -88,7 +89,7 @@ downloaded image. It copies it to `img/hurd.work.img` and edits the copy:
 3. Apply the offline edits with `debugfs -w`:
    - `/boot/grub/grub.cfg` - serial console and auto-boot (see below),
    - `/etc/default/grub` - the same settings, so `update-grub` keeps them,
-   - `/etc/shadow` - password hash for `root` and `demo`,
+   - `/etc/shadow` - password hash for `root`,
    - `/etc/ssh/sshd_config.d/10-local.conf` - permit root password login.
 
 The GRUB configuration of the image is **patched, not replaced**: it knows
@@ -122,9 +123,12 @@ the guest waits at the GRUB menu and never boots unattended.
 The password hash is generated with `openssl passwd -6` (`$6$`, SHA-512).
 `/etc/login.defs` of the image names `YESCRYPT` as the preferred method, but the
 Hurd libc `crypt` does not support `$y$` hashes, so `$6$` is the only safe
-choice. Every account gets its own random salt, and the password is passed to
-`openssl` through standard input so that it does not show up in the process
-list.
+choice. The hash uses a random salt, and the password is passed to `openssl`
+through standard input so that it does not show up in the process list.
+
+Only the `root` account gets its password here, because it is the account that
+the provisioning logs in with. The account of the image is renamed during the
+provisioning, and its password is set there, after the rename.
 
 ### Stage 3 - base image (`make base`)
 
@@ -155,6 +159,12 @@ base image and only replaces the base when everything succeeded:
    - install the packages of `GUEST_PACKAGES` (`curl python3` by default) when
      one of them is missing, and verify that every one of them is there
      afterwards,
+   - rename the account `demo` to `peon`, together with its group and its
+     home directory (see pitfalls 36 and 37), and give the renamed account
+     the configured password,
+   - generate the SSH key of `root` and of `peon` on the host, if the pair does
+     not exist yet, and install the public key of each account in the guest,
+   - check that the login with the key of every account works,
    - if `/root/.provisioned` exists, stop here ("Image is already provisioned."),
    - otherwise run `apt-get update` and `apt-get upgrade` **only** when
      `RUN_APT_UPGRADE=1` is set, and create the marker,
@@ -211,6 +221,40 @@ from `img/tmp/` looks for `img/tmp/img/hurd.base.qcow2`.
 The base image is only ever used as a read-only backing file, so it stays
 pristine; all writes land in the overlay in `img/tmp/`.
 
+## SSH keys
+
+The provisioning gives `root` and `peon` an SSH key, so that the guest can be
+logged into without a password:
+
+```
+img/keys/root_ed25519      private key of the root account
+img/keys/root_ed25519.pub  public key of the root account
+img/keys/peon_ed25519      private key of the peon account
+img/keys/peon_ed25519.pub  public key of the peon account
+```
+
+The pairs are generated on the host with `ssh-keygen -t ed25519` and are never
+replaced: the public key of a pair is installed in the guest, and a new pair
+would lock the guest out of the key login until it is installed again. The
+private keys stay in `img/`, which is not in git, so they never end up in the
+repository.
+
+The public key of an account is appended to `~/.ssh/authorized_keys` of the
+account in the guest. The directory has the mode 700, the file the mode 600,
+and both belong to the account, because sshd refuses the key otherwise
+(`StrictModes`).
+
+Login with a key:
+
+```
+ssh -i img/keys/root_ed25519 -p 2222 root@127.0.0.1
+ssh -i img/keys/peon_ed25519 -p 2222 peon@127.0.0.1
+```
+
+`make ssh` and `make ssh-peon` do the same and fall back to the password when
+the key does not exist. The password of the accounts keeps working; the keys
+are an addition, not a replacement.
+
 ### Offline filesystem repair (`scripts/repair_filesystem.sh`)
 
 `repair_filesystem.sh <image> [partition]` repairs the root filesystem of a
@@ -253,14 +297,14 @@ Every one of these was hit while building this pipeline.
    obtains, so the drop-in wins.
 
 2. **An empty root password is not enough.** Even with `PermitRootLogin yes`,
-   `PermitEmptyPasswords` defaults to `no`. The image ships `root` and `demo`
-   with empty password fields, so a non-empty password has to be set.
+   `PermitEmptyPasswords` defaults to `no`. The image ships `root` and its user
+   account with empty password fields, so a non-empty password has to be set.
 
 3. **Rewriting `/etc/shadow` from scratch breaks everything.** The file has one
    line per account and **nine** colon-separated fields. A rewrite that emits
    eight fields and only the root line deletes 20 accounts and makes the
    malformed entry crash the console `login` with SIGSEGV. Fix: dump the file
-   with `debugfs`, replace **only field 2** of the `root` and `demo` lines with
+   with `debugfs`, replace **only field 2** of the `root` line with
    `awk -F: -v OFS=: ...`, and write it back with mode `0100640`, uid 0, gid 42
    (the `shadow` group). Note the `=` in `-v OFS=:`; `-v OFS:` is an awk usage
    error.
@@ -480,6 +524,45 @@ Every one of these was hit while building this pipeline.
     (2.43) into the image. That is the same source that ships the broken
     `hurd-dev`, which is why that one package is held and pinned.
 
+36. **Renaming the user alone leaves the old name behind.** `usermod -l peon
+    demo` renames the account in `/etc/passwd` and `/etc/shadow`, but the
+    primary group keeps the name "demo" (the account then belongs to the
+    group "demo"), and the comment field of the account (the fifth field of
+    `/etc/passwd`) still says "demo". Fix: rename the group first
+    (`groupmod -n peon demo`), rename the user with the new home directory
+    (`usermod -l peon -d /home/peon -m demo`) and set the comment
+    (`usermod -c 'peon,,,' peon`). The provisioning checks afterwards that
+    the old name is gone from `/etc/passwd`, `/etc/shadow` and `/etc/group`.
+
+37. **A key is only accepted with the right modes and ownership.** sshd
+    checks the home directory, the `.ssh` directory and the
+    `authorized_keys` file: the `.ssh` directory has to have the mode 700,
+    the file the mode 600, and both have to belong to the account. Otherwise
+    the login is refused with "Authentication refused: bad ownership or
+    modes".
+
+38. **A new key pair locks the guest out of the key login.** The public key
+    in the guest belongs to the pair in `img/keys`. A new pair has a new
+    public key, so the key login fails until the new public key is installed
+    in the guest, which the provisioning does. Fix: never replace the key
+    pairs; when they are lost, remove `img/keys` and run `make provision`
+    again, or log in with the password.
+
+39. **The commands of the provisioning end up in the history of the guest.**
+    The driver logs into an interactive shell, and every command that it
+    sends is recorded in `/root/.bash_history`. That file then holds the
+    password hash of the accounts, which is enough to log in as root or as
+    the user account. Fix: the driver disables the history of the session
+    (`export HISTFILE=/dev/null` and `set +o history`) right after the
+    login, next to `stty -echo`.
+
+40. **The name of the account of the image is only known in one place.** The
+    image calls its user account "demo", and the provisioning renames it.
+    The name therefore belongs to a single constant (`OLD_ACCOUNT` in
+    `scripts/provision_guest.py`); the offline preparation must not mention
+    it, because the password of the account is set after the rename, in the
+    guest.
+
 ## Known issue: ext2 without a journal
 
 The root filesystem of the Hurd image is ext2 **without a journal**. The guest
@@ -555,6 +638,28 @@ archive, so `apt-get update` runs first. A package that is added to the list
 reaches the images that were provisioned before it was added, because the
 installation does not depend on the provision marker.
 
+### Change the name of the user account
+
+The names are `OLD_ACCOUNT` and `NEW_ACCOUNT` in `scripts/provision_guest.py`,
+and `NEW_ACCOUNT_HOME` holds the home directory of the renamed account. The
+rename covers the account in `/etc/passwd` and `/etc/shadow`, its group and
+its home directory, and the provisioning checks that the old name is gone
+everywhere. The renamed account gets the configured password
+(`ROOT_PASSWORD` of the `Makefile`) in the same run, so that the offline
+preparation does not have to know the name of the account of the image. A
+fresh base image (`rm -f img/hurd.base.qcow2 && make base && make provision`)
+starts again with the account of the image.
+
+The accounts that get an SSH key are in `KEY_ACCOUNTS` in the same file,
+together with their home directory.
+
+### Replace the SSH keys
+
+Remove `img/keys` and run `make provision` again: the pairs are generated
+again and the new public keys are installed in the guest. The private keys of
+the old pairs stop working, and the password of the accounts keeps working in
+the meantime.
+
 ### Change the SSH port or the network device
 
 `SSH_PORT` in the `Makefile` is the port on the host that is forwarded to port
@@ -611,6 +716,15 @@ python3 -c 'import pexpect; c = pexpect.spawn("ssh", ["-o", "StrictHostKeyChecki
     "-o", "UserKnownHostsFile=/dev/null", "-o", "PreferredAuthentications=password",
     "-o", "PubkeyAuthentication=no", "-p", "2222", "root@127.0.0.1", "id"], encoding="utf-8");
     c.expect("password:"); c.sendline("abcdef"); c.expect(pexpect.EOF); print(c.before)'
+```
+
+Check the login with the keys (the guest has to be running):
+
+```
+ssh -i img/keys/root_ed25519 -o StrictHostKeyChecking=no \
+    -o UserKnownHostsFile=/dev/null -p 2222 root@127.0.0.1 id
+ssh -i img/keys/peon_ed25519 -o StrictHostKeyChecking=no \
+    -o UserKnownHostsFile=/dev/null -p 2222 peon@127.0.0.1 id
 ```
 
 ## Constraints

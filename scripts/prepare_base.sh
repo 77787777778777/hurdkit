@@ -10,7 +10,7 @@
 # Changes applied offline (no VM boot required):
 #   * /boot/grub/grub.cfg              - serial console + auto-boot
 #   * /etc/default/grub                - same settings, for update-grub
-#   * /etc/shadow                      - password hashes for root and demo
+#   * /etc/shadow                      - password hash for root
 #   * /etc/ssh/sshd_config.d/10-local.conf - permit root password login
 #
 # The resulting image is expected to be converted to qcow2 by the caller.
@@ -46,15 +46,13 @@ fi
 # $6$ (SHA-512) is supported by glibc; yescrypt ($y$) is not, even though
 # /etc/login.defs names it as the preferred method.
 #
-# Each account gets its own random salt, so that two accounts with the same
-# password do not end up with the same hash. The password is passed through
-# standard input, so that it does not show up in the process list.
+# The hash uses a random salt, and the password is passed through standard
+# input, so that it does not show up in the process list.
 password_hash() {
     printf '%s' "$ROOT_PASSWORD" | openssl passwd -6 -stdin
 }
 
 ROOT_HASH="$(password_hash)"
-DEMO_HASH="$(password_hash)"
 
 TMP_DIR="$(mktemp -d)"
 # A dedicated mount point per run: a leftover FUSE mount from an earlier run
@@ -177,13 +175,17 @@ echo "Using kernel $KERNEL_PATH"
 # The shipped file has one line per account and nine colon-separated
 # fields. Rewriting it from scratch drops the accounts and produces
 # malformed entries, which breaks logins for every user.
-# Dump it, replace only the password field of root and demo, and write it
-# back with the original ownership and permissions.
+# Dump it, replace only the password field of root, and write it back
+# with the original ownership and permissions.
+#
+# Only the root account gets its password here, because it is the account
+# that the provisioning logs in with. The account of the image is renamed
+# during the provisioning, and its password is set there, after the
+# rename.
 debugfs -R "dump /etc/shadow $TMP_DIR/shadow.orig" "$PART_FILE" 2>/dev/null
 
-awk -F: -v OFS=: -v root_hash="$ROOT_HASH" -v demo_hash="$DEMO_HASH" '
+awk -F: -v OFS=: -v root_hash="$ROOT_HASH" '
     $1 == "root" { $2 = root_hash }
-    $1 == "demo" { $2 = demo_hash }
     { print }
 ' "$TMP_DIR/shadow.orig" > "$TMP_DIR/shadow.new"
 
@@ -203,13 +205,11 @@ if [[ "$BROKEN_LINES" != "0" ]]; then
     exit 1
 fi
 
-for account in root demo; do
-    if ! awk -F: -v name="$account" -v root_hash="$ROOT_HASH" -v demo_hash="$DEMO_HASH" \
-        '$1 == name && $2 == (name == "root" ? root_hash : demo_hash) { found = 1 } END { exit !found }' "$TMP_DIR/shadow.new"; then
-        echo "Password hash for $account was not applied" >&2
-        exit 1
-    fi
-done
+if ! awk -F: -v root_hash="$ROOT_HASH" \
+    '$1 == "root" && $2 == root_hash { found = 1 } END { exit !found }' "$TMP_DIR/shadow.new"; then
+    echo "Password hash for root was not applied" >&2
+    exit 1
+fi
 
 # Build debugfs command script (no shell syntax, no comments)
 CMDS_FILE="$TMP_DIR/debugfs.cmds"

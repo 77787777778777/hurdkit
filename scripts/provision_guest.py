@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Drive the Hurd guest over SSH while the base image is provisioned.
 
-The script logs in as root, prepares the apt sources of the guest and,
+The script logs in as root, prepares the apt sources of the guest, renames
+the user account of the image, installs the SSH keys of the accounts and,
 when it is asked to, runs the package upgrade. It does the same work as
 the expect script that used to live in scripts/provision_base.sh, but
 without the quoting games of expect and Tcl.
@@ -15,6 +16,8 @@ The configuration comes from the environment:
     RUN_APT_UPGRADE   "1" runs "apt-get update" and "apt-get upgrade"
     GUEST_PACKAGES    the packages that the guest gets (default
                       "curl python3")
+    SSH_KEY_DIR       the directory with the SSH keys of the accounts
+                      (default "img/keys")
 
 Exit codes:
 
@@ -26,6 +29,7 @@ Exit codes:
 
 import os
 import re
+import subprocess
 import sys
 
 try:
@@ -38,6 +42,21 @@ except ImportError:
 LOGIN_TIMEOUT = 120
 # The package upgrade takes minutes.
 COMMAND_TIMEOUT = 3600
+# The login with a key is a local connection to a running guest.
+KEY_LOGIN_TIMEOUT = 60
+
+# The name of the user account in the image. The image calls it "demo",
+# which says more about the image than about the account, so the
+# provisioning renames it. This is the only place that knows the name of
+# the account of the image.
+OLD_ACCOUNT = "demo"
+NEW_ACCOUNT = "peon"
+NEW_ACCOUNT_HOME = "/home/peon"
+
+# The accounts that get an SSH key, with their home directory. The key
+# pairs are generated on the host and are kept there, so that the guest
+# can be logged into without a password.
+KEY_ACCOUNTS = (("root", "/root"), (NEW_ACCOUNT, NEW_ACCOUNT_HOME))
 
 PROMPT = re.compile(r"# $")
 PASSWORD_PROMPT = re.compile(r"(?i)password:")
@@ -102,12 +121,16 @@ class GuestSession:
         # The guest echoes the command lines, and the echoed text cannot be
         # told apart from the output of the command. Turning the echo off
         # makes the shell prompt the only synchronisation point.
-        self.child.send("stty -echo\r")
+        #
+        # The history of the shell is disabled as well: the session is
+        # interactive, so every command would end up in the history file
+        # of the guest, including the commands that carry a password hash.
+        self.child.send("stty -echo; export HISTFILE=/dev/null; set +o history\r")
         index = self.child.expect(
             [PROMPT, pexpect.EOF, pexpect.TIMEOUT], timeout=LOGIN_TIMEOUT
         )
         if index != 0:
-            raise GuestError("Timeout disabling the terminal echo", 1)
+            raise GuestError("Timeout preparing the shell of the guest", 1)
 
     def run_command(self, command, tag):
         """Run a command in the guest and return its exit status.
@@ -294,6 +317,200 @@ def install_packages(session, packages):
             raise GuestError(f"{package} is missing after the installation")
 
 
+def set_account_password(session, account, password):
+    """Set the password of an account in the guest.
+
+    The hash is made on the host, so that the plaintext password never
+    reaches the guest. The hash is written with usermod, which is the
+    tool of the image for the password of an account.
+    """
+    digest = subprocess.run(
+        ["openssl", "passwd", "-6", "-stdin"],
+        input=password,
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=KEY_LOGIN_TIMEOUT,
+    ).stdout.strip()
+
+    session.run_command(f"usermod -p '{digest}' {account}", f"password_{account}")
+
+    status = session.run_command(
+        f"grep -qF '{account}:{digest}:' /etc/shadow", f"password_{account}_check"
+    )
+    if status != 0:
+        raise GuestError(f"The password of {account} was not applied")
+
+
+def rename_account(session, old_name, new_name):
+    """Rename the user account of the image in the guest.
+
+    The account of the image has a name that says more about the image
+    than about the account, so it gets the name of a person. The group is
+    renamed first, because usermod refuses to rename a user whose primary
+    group has the same name as the user.
+    """
+    user_is_old = (
+        session.run_command(f"grep -q '^{old_name}:' /etc/passwd", "account_check")
+        == 0
+    )
+    user_is_new = (
+        session.run_command(f"grep -q '^{new_name}:' /etc/passwd", "account_check_new")
+        == 0
+    )
+    if not user_is_old and not user_is_new:
+        raise GuestError(
+            f"The guest has neither a {old_name} nor a {new_name} account"
+        )
+
+    if session.run_command(f"grep -q '^{old_name}:' /etc/group", "account_group_check") == 0:
+        print(f"Renaming the account {old_name} to {new_name}...", flush=True)
+        session.run_command(f"groupmod -n {new_name} {old_name}", "account_group")
+    elif not user_is_old:
+        print(f"The account is already named {new_name}.", flush=True)
+
+    if user_is_old:
+        # The home directory of the account moves with it. An image without
+        # a home directory for the account needs no move.
+        session.run_command(
+            f"if [ -d /home/{old_name} ]; then "
+            f"usermod -l {new_name} -d /home/{new_name} -m {old_name}; "
+            f"else usermod -l {new_name} -d /home/{new_name} {old_name}; fi",
+            "account_rename",
+        )
+        # The comment field of the account still holds the old name.
+        session.run_command(
+            f"usermod -c '{new_name},,,' {new_name}", "account_comment"
+        )
+
+    # A half-renamed account leaves the old name behind in the shadow file
+    # or in the group file, and the login of the account then fails.
+    for path in ("/etc/passwd", "/etc/shadow", "/etc/group"):
+        if session.run_command(f"grep -q '^{old_name}:' {path}", "account_verify") == 0:
+            raise GuestError(f"The account {old_name} is still in {path}")
+    for path in ("/etc/passwd", "/etc/shadow"):
+        if session.run_command(f"grep -q '^{new_name}:' {path}", "account_verify_new") != 0:
+            raise GuestError(f"The account {new_name} is missing in {path}")
+    if session.run_command(f"test -d /home/{new_name}", "account_home") != 0:
+        raise GuestError(f"The home directory /home/{new_name} is missing")
+
+
+def ensure_keypair(key_dir, account):
+    """Make sure that an SSH key pair for the account exists.
+
+    The keys are generated on the host and are never replaced: the public
+    key of the pair is installed in the guest, and a new pair would lock
+    the guest out of the key login until it is installed again.
+    """
+    os.makedirs(key_dir, mode=0o700, exist_ok=True)
+    os.chmod(key_dir, 0o700)
+    private_key = os.path.join(key_dir, f"{account}_ed25519")
+    public_key = f"{private_key}.pub"
+
+    if not os.path.exists(private_key):
+        print(f"Generating the SSH key of {account}...", flush=True)
+        subprocess.run(
+            [
+                "ssh-keygen",
+                "-q",
+                "-t",
+                "ed25519",
+                "-N",
+                "",
+                "-C",
+                f"{account}@hurd",
+                "-f",
+                private_key,
+            ],
+            check=True,
+            timeout=KEY_LOGIN_TIMEOUT,
+        )
+    # ssh refuses a private key that other users can read.
+    os.chmod(private_key, 0o600)
+
+    if not os.path.exists(public_key):
+        # The public key can be derived from the private one.
+        derived = subprocess.run(
+            ["ssh-keygen", "-y", "-f", private_key],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=KEY_LOGIN_TIMEOUT,
+        )
+        with open(public_key, "w", encoding="utf-8") as public_file:
+            public_file.write(derived.stdout)
+
+    return private_key, public_key
+
+
+def install_authorized_key(session, account, home, public_key_path):
+    """Install the public key of an account in the guest.
+
+    The key is appended, so that the keys of other people survive a
+    provisioning run.
+    """
+    with open(public_key_path, encoding="utf-8") as key_file:
+        key = key_file.read().strip()
+    if "'" in key:
+        raise GuestError(f"The public key of {account} contains a quote")
+
+    session.run_command(
+        f"mkdir -p {home}/.ssh && chmod 700 {home}/.ssh && "
+        f"touch {home}/.ssh/authorized_keys && "
+        f"{{ grep -qxF '{key}' {home}/.ssh/authorized_keys || "
+        f"printf '%s\\n' '{key}' >> {home}/.ssh/authorized_keys; }} && "
+        f"chmod 600 {home}/.ssh/authorized_keys && "
+        f"chown -R {account}:{account} {home}/.ssh",
+        f"authorized_key_{account}",
+    )
+
+
+def install_authorized_keys(session, key_dir):
+    """Install the public keys of the accounts in the guest."""
+    key_pairs = []
+    for account, home in KEY_ACCOUNTS:
+        private_key, public_key = ensure_keypair(key_dir, account)
+        print(f"Installing the SSH key of {account}...", flush=True)
+        install_authorized_key(session, account, home, public_key)
+        key_pairs.append((account, private_key))
+    return key_pairs
+
+
+def verify_key_login(host, port, account, private_key):
+    """Log into the guest with the key of an account.
+
+    The client is told not to ask for a password, so the login only works
+    when the key is really accepted by the guest.
+    """
+    result = subprocess.run(
+        [
+            "ssh",
+            "-i",
+            private_key,
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-o",
+            "UserKnownHostsFile=/dev/null",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "PasswordAuthentication=no",
+            "-p",
+            str(port),
+            f"{account}@{host}",
+            "id -un",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=KEY_LOGIN_TIMEOUT,
+    )
+    if result.returncode != 0 or result.stdout.strip() != account:
+        raise GuestError(
+            f"The SSH key of {account} does not log into the guest: "
+            f"{result.stderr.strip()}"
+        )
+
+
 def upgrade_packages(session):
     """Update the packages of the guest."""
     # The downloaded .deb files stay in the package cache, which needs
@@ -331,7 +548,7 @@ def upgrade_packages(session):
     session.run_command("apt-get clean", "apt_clean")
 
 
-def provision(session, run_apt_upgrade, packages):
+def provision(session, run_apt_upgrade, packages, key_dir, password):
     disable_unreleased_suite(session)
     hold_hurd_dev(session)
 
@@ -340,9 +557,15 @@ def provision(session, run_apt_upgrade, packages):
     # were provisioned before it was added.
     install_packages(session, packages)
 
+    # The account and the keys are set up on every run as well, so that
+    # they also reach the images that were provisioned before.
+    rename_account(session, OLD_ACCOUNT, NEW_ACCOUNT)
+    set_account_password(session, NEW_ACCOUNT, password)
+    key_pairs = install_authorized_keys(session, key_dir)
+
     if session.run_command("test -f /root/.provisioned", "marker") == 0:
         print("Image is already provisioned.", flush=True)
-        return
+        return key_pairs
 
     if run_apt_upgrade:
         upgrade_packages(session)
@@ -351,6 +574,7 @@ def provision(session, run_apt_upgrade, packages):
 
     # Write the provision marker
     session.run_command("touch /root/.provisioned", "marker_write")
+    return key_pairs
 
 
 def main():
@@ -359,10 +583,15 @@ def main():
     password = os.environ.get("ROOT_PASSWORD", "")
     run_apt_upgrade = os.environ.get("RUN_APT_UPGRADE", "0") == "1"
     packages = os.environ.get("GUEST_PACKAGES", "curl python3").split()
+    key_dir = os.environ.get("SSH_KEY_DIR", "img/keys")
 
     try:
         session = GuestSession(host, port, password)
-        provision(session, run_apt_upgrade, packages)
+        key_pairs = provision(session, run_apt_upgrade, packages, key_dir, password)
+        for account, private_key in key_pairs:
+            print(f"Checking the SSH key of {account}...", flush=True)
+            verify_key_login(host, port, account, private_key)
+            print(f"The SSH key of {account} works.", flush=True)
         session.poweroff()
     except GuestError as error:
         print(str(error), file=sys.stderr, flush=True)

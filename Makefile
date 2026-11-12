@@ -33,6 +33,9 @@ RUN_APT_UPGRADE := 0
 # The packages that the guest gets during the provisioning. The list can be
 # changed, and the provisioning installs the packages that are missing.
 GUEST_PACKAGES := curl python3
+# The SSH keys of the guest accounts. The private keys stay in this
+# directory and are used to log into the guest without a password.
+SSH_KEY_DIR   := $(IMG_DIR)/keys
 
 # Toolchain
 QEMU_SYSTEM   := qemu-system-x86_64
@@ -46,7 +49,7 @@ RM            := rm -f
 LOCK          := flock
 LOCK_FILE     := $(IMG_DIR)/.build.lock
 
-.PHONY: all download check base provision run run-nokvm ssh clean distclean
+.PHONY: all download check base provision run run-nokvm ssh ssh-peon clean distclean
 
 all: base
 
@@ -90,6 +93,7 @@ provision: $(BASE_IMG)
 		CPU_COUNT=$(CPU_COUNT) MEMORY=$(MEMORY) \
 		RUN_APT_UPGRADE=$(RUN_APT_UPGRADE) \
 		GUEST_PACKAGES="$(GUEST_PACKAGES)" \
+		SSH_KEY_DIR="$(abspath $(SSH_KEY_DIR))" \
 		bash scripts/provision_base.sh $(BASE_IMG) $(SSH_PORT)
 
 # Boot from a temporary overlay so the base image stays pristine
@@ -136,9 +140,22 @@ run-nokvm: $(BASE_IMG)
 		-device e1000,netdev=net0 \
 		-nographic
 
-# SSH into the running VM
+# SSH into the running VM (the key of the root account is used when it
+# exists, otherwise the password is asked for)
 ssh:
-	ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p $(SSH_PORT) root@$(SSH_HOST)
+	@KEY=""; \
+	if [ -f "$(SSH_KEY_DIR)/root_ed25519" ]; then \
+		KEY="-i $(SSH_KEY_DIR)/root_ed25519"; \
+	fi; \
+	ssh $$KEY -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p $(SSH_PORT) root@$(SSH_HOST)
+
+# SSH into the running VM as the peon account
+ssh-peon:
+	@KEY=""; \
+	if [ -f "$(SSH_KEY_DIR)/peon_ed25519" ]; then \
+		KEY="-i $(SSH_KEY_DIR)/peon_ed25519"; \
+	fi; \
+	ssh $$KEY -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p $(SSH_PORT) peon@$(SSH_HOST)
 
 # Remove temporary overlay images
 clean:
