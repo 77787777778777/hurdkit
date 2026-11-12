@@ -30,6 +30,9 @@ ROOT_PASSWORD := abcdef
 # hurd-dev that cannot be unpacked on Hurd. Set it to 1 to run
 # "apt-get update" and "apt-get upgrade" during the provisioning.
 RUN_APT_UPGRADE := 0
+# The packages that the guest gets during the provisioning. The list can be
+# changed, and the provisioning installs the packages that are missing.
+GUEST_PACKAGES := curl python3
 
 # Toolchain
 QEMU_SYSTEM   := qemu-system-x86_64
@@ -86,6 +89,7 @@ provision: $(BASE_IMG)
 	@$(LOCK) $(LOCK_FILE) env ROOT_PASSWORD=$(ROOT_PASSWORD) \
 		CPU_COUNT=$(CPU_COUNT) MEMORY=$(MEMORY) \
 		RUN_APT_UPGRADE=$(RUN_APT_UPGRADE) \
+		GUEST_PACKAGES="$(GUEST_PACKAGES)" \
 		bash scripts/provision_base.sh $(BASE_IMG) $(SSH_PORT)
 
 # Boot from a temporary overlay so the base image stays pristine

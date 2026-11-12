@@ -13,6 +13,8 @@ The configuration comes from the environment:
     SSH_PORT          the forwarded SSH port (default 2222)
     ROOT_PASSWORD     the password of the root account
     RUN_APT_UPGRADE   "1" runs "apt-get update" and "apt-get upgrade"
+    GUEST_PACKAGES    the packages that the guest gets (default
+                      "curl python3")
 
 Exit codes:
 
@@ -112,10 +114,19 @@ class GuestSession:
 
         The output of the command is left in /tmp/provision_<tag>.log in
         the guest, so that a failure can be inspected there.
+
+        The command runs in a group, so that the redirection of the output
+        covers the whole command. A redirection inside the command would
+        otherwise win over the redirection of the group, and the output of
+        the last command of a chain would be written to its own file
+        instead of the log file.
         """
         logfile = f"/tmp/provision_{tag}.log"
+        # A trailing semicolon would turn into ";;", which is a syntax error
+        # in the group.
+        command = command.rstrip().rstrip(";").rstrip()
         self.child.send(
-            f'{command} >{logfile} 2>&1; rc=$?; echo "__RC__${{rc}}__"\r'
+            f'{{ {command} ; }} >{logfile} 2>&1; rc=$?; echo "__RC__${{rc}}__"\r'
         )
         index = self.child.expect(
             [EXIT_STATUS, pexpect.EOF, pexpect.TIMEOUT], timeout=COMMAND_TIMEOUT
@@ -191,14 +202,96 @@ def hold_hurd_dev(session):
     select the broken version.
     """
     print("Holding hurd-dev...", flush=True)
-    session.run_command("apt-mark hold hurd-dev", "hurd_dev_hold")
+
+    # The pin is written before the hold, because a pin without a priority
+    # makes every apt command fail with "No priority (or zero) specified
+    # for pin".
     session.run_command(
         "mkdir -p /etc/apt/preferences.d && "
-        "echo 'Package: hurd-dev' > /etc/apt/preferences.d/99-hurd-dev && "
-        "echo 'Pin: release *' >> /etc/apt/preferences.d/99-hurd-dev && "
-        "echo 'Pin-Priority: -1' >> /etc/apt/preferences.d/99-hurd-dev",
+        "printf 'Package: hurd-dev\\nPin: release *\\nPin-Priority: -1\\n' "
+        "> /etc/apt/preferences.d/99-hurd-dev",
         "hurd_dev_pin",
     )
+    status = session.run_command(
+        "grep -q '^Pin-Priority: -1$' /etc/apt/preferences.d/99-hurd-dev",
+        "hurd_dev_pin_check",
+    )
+    if status != 0:
+        raise GuestError("The apt pin for hurd-dev was not written correctly")
+
+    session.run_command("apt-mark hold hurd-dev", "hurd_dev_hold")
+    status = session.run_command(
+        "apt-mark showhold | grep -q '^hurd-dev$'", "hurd_dev_hold_check"
+    )
+    if status != 0:
+        raise GuestError("The hurd-dev package is not held")
+
+
+def install_packages(session, packages):
+    """Install the packages that the guest needs.
+
+    The check is by command, not by package status: the packages are only
+    needed as working tools, and the check has to work for a guest that
+    was provisioned before the package was added to the list. The install
+    itself names all the packages, so that the ones that are already
+    installed are brought up to the version of the archive as well.
+
+    The installation needs the package lists of the archive, which the
+    image does not ship, so the lists are fetched first.
+    """
+    if not packages:
+        print("No packages to install.", flush=True)
+        return
+
+    missing = []
+    for package in packages:
+        status = session.run_command(
+            f"command -v {package} >/dev/null 2>&1", f"check_{package}"
+        )
+        if status != 0:
+            missing.append(package)
+    if not missing:
+        print(f"{' and '.join(packages)} are already installed.", flush=True)
+        return
+
+    print("Updating the package lists...", flush=True)
+    status = session.run_command(
+        "apt-get update -o Acquire::Languages=none", "apt_update"
+    )
+    if status != 0:
+        raise GuestError(f"apt-get update failed with status {status}")
+
+    print(f"Installing {' and '.join(packages)}...", flush=True)
+    status = session.run_command(
+        "DEBIAN_FRONTEND=noninteractive apt-get -y "
+        "-o APT::Install-Recommends=false install " + " ".join(packages),
+        "apt_install",
+    )
+    if status != 0:
+        print(f"apt-get install failed with status {status}", flush=True)
+        print(
+            "The output of the failed command is in "
+            "/tmp/provision_apt_install.log in the guest",
+            flush=True,
+        )
+        # A failed installation leaves dpkg in an inconsistent state. Repairing
+        # it in the guest is worth one attempt, but a second failure needs
+        # a fresh guest: the ext2 filesystem of the image has no journal
+        # and does not survive a failed unpack.
+        session.run_command("dpkg --configure -a", "dpkg_configure")
+        status = session.run_command("apt-get -f -y install", "apt_fix")
+        if status != 0:
+            raise GuestError(f"apt-get -f install failed with status {status}")
+
+    # Reclaim the space taken by the downloaded packages
+    session.run_command("apt-get clean", "apt_clean")
+
+    for package in packages:
+        status = session.run_command(
+            f"command -v {package} >/dev/null 2>&1", f"verify_{package}"
+        )
+        if status != 0:
+            raise GuestError(f"{package} is missing after the installation")
 
 
 def upgrade_packages(session):
@@ -238,9 +331,14 @@ def upgrade_packages(session):
     session.run_command("apt-get clean", "apt_clean")
 
 
-def provision(session, run_apt_upgrade):
+def provision(session, run_apt_upgrade, packages):
     disable_unreleased_suite(session)
     hold_hurd_dev(session)
+
+    # The packages are installed on every run, not only on the first one:
+    # a package that is added to the list has to reach the images that
+    # were provisioned before it was added.
+    install_packages(session, packages)
 
     if session.run_command("test -f /root/.provisioned", "marker") == 0:
         print("Image is already provisioned.", flush=True)
@@ -260,10 +358,11 @@ def main():
     port = int(os.environ.get("SSH_PORT", "2222"))
     password = os.environ.get("ROOT_PASSWORD", "")
     run_apt_upgrade = os.environ.get("RUN_APT_UPGRADE", "0") == "1"
+    packages = os.environ.get("GUEST_PACKAGES", "curl python3").split()
 
     try:
         session = GuestSession(host, port, password)
-        provision(session, run_apt_upgrade)
+        provision(session, run_apt_upgrade, packages)
         session.poweroff()
     except GuestError as error:
         print(str(error), file=sys.stderr, flush=True)

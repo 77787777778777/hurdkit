@@ -152,6 +152,9 @@ base image and only replaces the base when everything succeeded:
      `/tmp/provision_<tag>.log`,
    - remove the "unreleased" suite from the apt sources and hold `hurd-dev`
      (see pitfalls 29 and 30),
+   - install the packages of `GUEST_PACKAGES` (`curl python3` by default) when
+     one of them is missing, and verify that every one of them is there
+     afterwards,
    - if `/root/.provisioned` exists, stop here ("Image is already provisioned."),
    - otherwise run `apt-get update` and `apt-get upgrade` **only** when
      `RUN_APT_UPGRADE=1` is set, and create the marker,
@@ -172,6 +175,18 @@ the default provisioning only prepares the sources and writes the marker.
 Set `RUN_APT_UPGRADE=1` to run `apt-get update` and `apt-get upgrade` again;
 the guest then holds `hurd-dev` and the upgrade is attempted with the old
 configuration files (`--force-confold`).
+
+The installation of the packages is **not** part of the upgrade and runs on
+every provisioning. The list comes from `GUEST_PACKAGES` in the `Makefile`
+(`curl python3` by default) and is passed through
+`scripts/provision_base.sh` to the driver. The check is by command
+(`command -v`), so the installation is skipped when every package is already
+there: a provisioning of an already provisioned image stays a no-op, and a
+package that is added to the list reaches the images that were provisioned
+before it was added. The image ships no package lists, so `apt-get update`
+runs before the installation. Installing `curl` brings the current libc and
+python3 of the archive into the image (2.43 and 3.14 at the time of writing);
+the pin of `hurd-dev` keeps the broken package of sid out of it.
 
 ### Stage 5 - runtime (`make run`, `make run-nokvm`)
 
@@ -434,6 +449,37 @@ Every one of these was hit while building this pipeline.
     The provisioning script waits for QEMU to exit anyway and terminates it
     when the guest does not shut down.
 
+32. **The redirection of the log file swallows the output of the last command
+    of a chain.** `run_command` sends the command with
+    `>logfile 2>&1` appended. In `cmd1 && cmd2 >file`, the redirection of
+    `cmd2` wins over the one of the log file, so `cmd2` writes into `file`
+    and nothing lands in the log. The pin of `hurd-dev` was written that way
+    and lost its last line, which made every apt command in the guest fail
+    with "E: No priority (or zero) specified for pin". Fix: run the command
+    in a group (`{ cmd ; } >logfile 2>&1`), so that the redirection of the log
+    covers the whole command, and write files with a single `printf` instead
+    of a chain of `echo` commands.
+
+33. **A pin without a priority breaks every apt command.** A pin block in
+    `/etc/apt/preferences.d/` that has no `Pin-Priority` makes apt stop with
+    "E: No priority (or zero) specified for pin", so neither `apt-get
+    install` nor `apt-cache policy` works any more. Fix: write the pin with
+    all three lines (`Package`, `Pin`, `Pin-Priority`) and verify it with a
+    `grep` before any apt command runs.
+
+34. **The image ships no package lists.** `/var/lib/apt/lists` of the image is
+    empty, so `apt-get install` fails with "Unable to locate package" until
+    `apt-get update` has fetched the lists of the archive (15 MB, about 12
+    seconds). Fix: the provisioning runs `apt-get update` before the
+    installation.
+
+35. **The archive of the Hurd port is sid.** The packages come from
+    `deb.debian.org/debian-ports sid main`, so the guest gets the versions of
+    the unstable archive: `curl` is currently a release candidate
+    (`8.23.0~rc2`), and the installation of a package can pull a new libc
+    (2.43) into the image. That is the same source that ships the broken
+    `hurd-dev`, which is why that one package is held and pinned.
+
 ## Known issue: ext2 without a journal
 
 The root filesystem of the Hurd image is ext2 **without a journal**. The guest
@@ -498,6 +544,16 @@ command, so check it and fail the provisioning when it fails.
 Steps that must run before the marker is written belong above
 `session.run_command("touch /root/.provisioned", "marker_write")`; steps that
 must run on every boot belong below it.
+
+### Change the packages of the guest
+
+Set `GUEST_PACKAGES` in the `Makefile`, for example
+`GUEST_PACKAGES := curl python3 wget`. The list is passed to the driver,
+which installs the packages that are missing and verifies that every one of
+them is there afterwards. The installation needs the package lists of the
+archive, so `apt-get update` runs first. A package that is added to the list
+reaches the images that were provisioned before it was added, because the
+installation does not depend on the provision marker.
 
 ### Change the SSH port or the network device
 

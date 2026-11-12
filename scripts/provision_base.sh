@@ -42,6 +42,10 @@ MEMORY="${MEMORY:-2G}"
 # upgrade. Set RUN_APT_UPGRADE=1 to enable it again.
 RUN_APT_UPGRADE="${RUN_APT_UPGRADE:-0}"
 
+# The packages that the guest gets. The list is configurable, so that the
+# image can carry other tools.
+GUEST_PACKAGES="${GUEST_PACKAGES:-curl python3}"
+
 if [[ ! -f "$BASE_IMG" ]]; then
     echo "Base image not found: $BASE_IMG" >&2
     exit 1
@@ -143,6 +147,7 @@ SSH_RC=0
 for attempt in $(seq 1 12); do
     if SSH_HOST="$SSH_HOST" SSH_PORT="$SSH_PORT" ROOT_PASSWORD="$ROOT_PASSWORD" \
     RUN_APT_UPGRADE="$RUN_APT_UPGRADE" \
+    GUEST_PACKAGES="$GUEST_PACKAGES" \
     python3 "$SCRIPT_DIR/provision_guest.py"; then
         SSH_RC=0
         break
