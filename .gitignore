@@ -1,3 +1,4 @@
+toolchain/*.log
 img/
-3p/
+3p
 __pycache__/

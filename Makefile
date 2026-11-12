@@ -49,7 +49,7 @@ RM            := rm -f
 LOCK          := flock
 LOCK_FILE     := $(IMG_DIR)/.build.lock
 
-.PHONY: all download check base provision run run-nokvm ssh ssh-peon clean distclean
+.PHONY: all download check base provision run run-nokvm ssh ssh-peon clean distclean toolchain toolchain-clean toolchain-docker verify-vm hurd-build 9pfs fetch-3p
 
 all: base
 
@@ -156,6 +156,54 @@ ssh-peon:
 		KEY="-i $(SSH_KEY_DIR)/peon_ed25519"; \
 	fi; \
 	ssh $$KEY -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p $(SSH_PORT) peon@$(SSH_HOST)
+
+# --- 3p sources (cloned only if they do not exist) ---
+# The toolchain builds against git checkouts under 3p/. They are shared
+# between this and other checkouts of the repo (3p may be a symlink to a
+# common directory), so fetch-3p never deletes, resets or rewrites an
+# existing repo; it only clones missing ones and then pins them to the
+# exact commits used for the verified build (via toolchain/Makefile).
+# The URLs match the verified checkouts.
+3P_DIR   ?= 3p
+3P_REPOS := mig:https://git.savannah.gnu.org/git/hurd/mig.git \
+            gnumach:https://git.savannah.gnu.org/git/hurd/gnumach.git \
+            glibc:https://sourceware.org/git/glibc.git \
+            hurd:https://github.com/joshumax/hurd.git \
+            9pfs:https://github.com/bugaevc/9pfs.git
+
+fetch-3p:
+	@set -e; \
+	if [ -L $(3P_DIR) ] && [ ! -d $(3P_DIR) ]; then \
+		echo "fetch-3p: $(3P_DIR) is a dangling symlink; point it at the 3p checkout"; \
+		exit 1; \
+	fi; \
+	if [ ! -e $(3P_DIR) ]; then mkdir $(3P_DIR); fi; \
+	if [ ! -d $(3P_DIR) ]; then echo "fetch-3p: $(3P_DIR) exists and is not a directory"; exit 1; fi; \
+	for spec in $(3P_REPOS); do \
+		repo=$${spec%%:*}; url=$${spec#*:}; \
+		if [ -d $(3P_DIR)/$$repo/.git ]; then \
+			echo "fetch-3p: $$repo already present, skipping"; \
+		elif [ -e $(3P_DIR)/$$repo ]; then \
+			echo "fetch-3p: $$repo exists but is not a git repo; refusing to overwrite"; \
+			exit 1; \
+		else \
+			echo "fetch-3p: cloning $$url into $(3P_DIR)/$$repo"; \
+			git clone $$url $(3P_DIR)/$$repo; \
+		fi; \
+	done
+	@if [ '$(3P_DIR)' = '3p' ]; then \
+		$(MAKE) -C toolchain 3p-pin; \
+	else \
+		echo "fetch-3p: non-default 3P_DIR; pin the tree manually with 'make -C toolchain 3p-pin' after pointing 3p at it"; \
+	fi
+
+# --- cross toolchain (delegates to toolchain/Makefile) ---
+toolchain: fetch-3p    ; $(MAKE) -C toolchain toolchain
+toolchain-clean:       ; $(MAKE) -C toolchain clean
+toolchain-docker: fetch-3p ; $(MAKE) -C toolchain toolchain BACKEND=docker
+hurd-build: fetch-3p   ; $(MAKE) -C toolchain hurd
+9pfs: fetch-3p         ; $(MAKE) -C toolchain 9pfs
+verify-vm: fetch-3p    ; $(MAKE) -C toolchain verify-vm
 
 # Remove temporary overlay images
 clean:

@@ -1,0 +1,34 @@
+# syntax=docker/dockerfile:1
+#
+# Builder image for the x86_64-gnu cross toolchain.
+#
+# Installs build tools + autotools, fetches/extracts binutils and gcc sources,
+# and copies docker-stages.sh. The actual build runs at docker run time
+# (stages 1-6) via docker-stages.sh, with /src/3p (host Hurd sources, ro) and
+# /opt/x86_64-gnu (install prefix, rw) bind-mounted. Nothing local is ever
+# COPYed into the image (stuff/crosscompile_plan.md, Appendix A).
+# MIG is built from the 3p/mig git checkout, not copied from a VM.
+# The container runs as the host user (see Makefile), so artifacts are
+# host-owned.
+#
+FROM debian:trixie
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential flex bison gperf gawk texinfo python3 file \
+        ca-certificates xz-utils wget git \
+        libgmp-dev libmpfr-dev libmpc-dev \
+        autoconf automake libtool \
+ && rm -rf /var/lib/apt/lists/* && apt-get clean
+WORKDIR /build
+# Fetch and extract toolchain sources (network only here). Tarballs removed
+# in the same layer; the extracted trees persist for the runtime build.
+RUN mkdir -p /build/src && cd /build/src && \
+    wget -q https://ftp.gnu.org/gnu/binutils/binutils-2.46.1.tar.xz && \
+    wget -q https://ftp.gnu.org/gnu/gcc/gcc-15.3.0/gcc-15.3.0.tar.xz && \
+    tar xf binutils-2.46.1.tar.xz && tar xf gcc-15.3.0.tar.xz && \
+    rm *.tar.xz
+COPY docker-stages.sh /docker-stages.sh
+RUN chmod +x /docker-stages.sh
+ENV PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+WORKDIR /build
+CMD ["/docker-stages.sh"]

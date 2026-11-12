@@ -1,0 +1,9 @@
+# Keep the Docker build context tiny: only this directory's recipe files.
+# Local sources (glibc, hurd, gnumach, 9pfs) are bind-mounted at run time,
+# never COPYed into the image (stuff/crosscompile_plan.md §4.2, Appendix A).
+*
+!Dockerfile*
+!Makefile
+!README.md
+!9p-server.py
+!docker-stages.sh
