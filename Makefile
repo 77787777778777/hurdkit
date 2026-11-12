@@ -26,6 +26,10 @@ CPU_COUNT     := 4
 SSH_PORT      := 2222
 SSH_HOST      := 127.0.0.1
 ROOT_PASSWORD := abcdef
+# The in-VM package upgrade is off by default: the sid archive ships a
+# hurd-dev that cannot be unpacked on Hurd. Set it to 1 to run
+# "apt-get update" and "apt-get upgrade" during the provisioning.
+RUN_APT_UPGRADE := 0
 
 # Toolchain
 QEMU_SYSTEM   := qemu-system-x86_64
@@ -66,7 +70,9 @@ base: $(BASE_IMG)
 
 # The image is built in a temporary file and moved into place, so that an
 # interrupted build never leaves a partially written base image behind.
-$(BASE_IMG): $(EXTRACT_STAMP)
+# The preparation script is a prerequisite, so that changing it rebuilds
+# the base image.
+$(BASE_IMG): $(EXTRACT_STAMP) scripts/prepare_base.sh
 	@$(MKDIR_P) $(IMG_DIR)
 	@$(LOCK) $(LOCK_FILE) sh -c 'set -e; \
 		ROOT_PASSWORD=$(ROOT_PASSWORD) bash scripts/prepare_base.sh $(RAW_IMG) $(WORK_IMG); \
@@ -78,27 +84,44 @@ $(BASE_IMG): $(EXTRACT_STAMP)
 provision: $(BASE_IMG)
 	@$(MKDIR_P) $(IMG_DIR)
 	@$(LOCK) $(LOCK_FILE) env ROOT_PASSWORD=$(ROOT_PASSWORD) \
+		CPU_COUNT=$(CPU_COUNT) MEMORY=$(MEMORY) \
+		RUN_APT_UPGRADE=$(RUN_APT_UPGRADE) \
 		bash scripts/provision_base.sh $(BASE_IMG) $(SSH_PORT)
 
 # Boot from a temporary overlay so the base image stays pristine
 run: $(BASE_IMG)
 	$(MKDIR_P) $(TMP_DIR)
 	@OVERLAY=$$(mktemp -u $(TMP_DIR)/XXXXXX.qcow2); \
+	trap 'rm -f "$$OVERLAY"' EXIT; \
 	$(QEMU_IMG) create -f qcow2 -b $(abspath $(BASE_IMG)) -F qcow2 $$OVERLAY; \
-	$(QEMU_SYSTEM) \
-		-enable-kvm \
-		-cpu host \
-		-smp $(CPU_COUNT) \
-		-m $(MEMORY) \
-		-drive file=$$OVERLAY,if=ide,cache=writeback \
-		-netdev user,id=net0,hostfwd=tcp:$(SSH_HOST):$(SSH_PORT)-:22 \
-		-device e1000,netdev=net0 \
-		-nographic
+	if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then \
+		echo "Booting with KVM acceleration" >&2; \
+		$(QEMU_SYSTEM) \
+			-enable-kvm \
+			-cpu host \
+			-smp $(CPU_COUNT) \
+			-m $(MEMORY) \
+			-drive file=$$OVERLAY,if=ide,cache=writeback \
+			-netdev user,id=net0,hostfwd=tcp:$(SSH_HOST):$(SSH_PORT)-:22 \
+			-device e1000,netdev=net0 \
+			-nographic; \
+	else \
+		echo "KVM is not available, booting without acceleration" >&2; \
+		$(QEMU_SYSTEM) \
+			-cpu max \
+			-smp $(CPU_COUNT) \
+			-m $(MEMORY) \
+			-drive file=$$OVERLAY,if=ide,cache=writeback \
+			-netdev user,id=net0,hostfwd=tcp:$(SSH_HOST):$(SSH_PORT)-:22 \
+			-device e1000,netdev=net0 \
+			-nographic; \
+	fi
 
 # Boot without KVM
 run-nokvm: $(BASE_IMG)
 	$(MKDIR_P) $(TMP_DIR)
 	@OVERLAY=$$(mktemp -u $(TMP_DIR)/XXXXXX.qcow2); \
+	trap 'rm -f "$$OVERLAY"' EXIT; \
 	$(QEMU_IMG) create -f qcow2 -b $(abspath $(BASE_IMG)) -F qcow2 $$OVERLAY; \
 	$(QEMU_SYSTEM) \
 		-cpu max \

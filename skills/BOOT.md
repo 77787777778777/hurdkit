@@ -89,27 +89,40 @@ downloaded image. It copies it to `img/hurd.work.img` and edits the copy:
    - `/etc/shadow` - password hash for `root` and `demo`,
    - `/etc/ssh/sshd_config.d/10-local.conf` - permit root password login.
 
-The GRUB configuration that makes the image boot unattended:
+The GRUB configuration of the image is **patched, not replaced**: it knows
+the kernel file, the translator modules and the filesystem UUID of the image,
+and every task symbol that the modules refer to (`acpi-task`, `disk-task`,
+`fs-task`, `exec-task`) has to be defined by exactly one module line. A
+hand-written configuration that misses one of them makes the kernel panic
+with "bootstrap script missing symbol 'acpi-task'" before the guest is up.
+Three settings are changed: the menu timeout becomes 0, the GRUB output goes
+to the console instead of the graphics console, and the Hurd console is put
+on the serial line (`console=com0`).
+
+The patched configuration and the kernel it refers to are checked before the
+file is written into the image, and the patched `/etc/shadow` is checked as
+well: the number of accounts, the number of fields per line and the new
+hashes are verified, because a malformed shadow file breaks the login of
+every user without any obvious error.
+
+The GRUB configuration that makes the image boot unattended is the
+configuration of the image with three changes:
 
 ```
-set default=0
-set timeout=0
-set terminal=console
-
-menuentry "GNU/Hurd" {
-    multiboot /boot/gnumach-1.8-amd64-up.gz root=part:2:device:wd0 console=com0
-    ...
-}
+terminal_output console      # instead of gfxterm, which is invisible in a serial terminal
+set timeout=0                # instead of 5 or 30, so that no key press is needed
+multiboot /boot/gnumach-1.8-amd64-up.gz root=part:2:device:wd0 console=com0
 ```
 
-`timeout=0` removes the menu delay, `terminal=console` keeps GRUB on the serial
-line, and `console=com0` hands the console to the Hurd kernel. Without these the
-guest waits at the GRUB prompt and never boots unattended.
+`console=com0` hands the console to the Hurd kernel. Without these changes
+the guest waits at the GRUB menu and never boots unattended.
 
 The password hash is generated with `openssl passwd -6` (`$6$`, SHA-512).
 `/etc/login.defs` of the image names `YESCRYPT` as the preferred method, but the
 Hurd libc `crypt` does not support `$y$` hashes, so `$6$` is the only safe
-choice.
+choice. Every account gets its own random salt, and the password is passed to
+`openssl` through standard input so that it does not show up in the process
+list.
 
 ### Stage 3 - base image (`make base`)
 
@@ -134,9 +147,11 @@ base image and only replaces the base when everything succeeded:
    - `run_command <cmd> <tag>` sends a command, captures its exit status through
      a `__RC__<n>__` marker and leaves the output in the guest's
      `/tmp/provision_<tag>.log`,
+   - remove the "unreleased" suite from the apt sources of the guest and
+     hold the `hurd-dev` package (see pitfalls 29 and 30),
    - if `/root/.provisioned` exists, stop here ("Image is already provisioned."),
-   - otherwise run `apt-get update`, `apt-get upgrade` and `apt-get clean`, then
-     create the marker,
+   - otherwise run `apt-get update` and `apt-get upgrade` **only** when
+     `RUN_APT_UPGRADE=1` is set, and create the marker,
    - `poweroff` the guest and wait for QEMU to exit. The SSH connection dies
      together with the guest, so the script does not wait for the exit status
      or the shell prompt of the poweroff command.
@@ -146,6 +161,14 @@ base image and only replaces the base when everything succeeded:
 The marker file `/root/.provisioned` is what makes the step idempotent. It
 lives in the guest, so it survives in the base image and is visible in every
 overlay booted from it.
+
+The package upgrade is **off by default** (`RUN_APT_UPGRADE=0` in the
+`Makefile`). The sid archive currently ships a `hurd-dev` that cannot be
+unpacked on Hurd, and the image is perfectly usable without the upgrade, so
+the default provisioning only prepares the sources and writes the marker.
+Set `RUN_APT_UPGRADE=1` to run `apt-get update` and `apt-get upgrade` again;
+the guest then holds `hurd-dev` and the upgrade is attempted with the old
+configuration files (`--force-confold`).
 
 ### Stage 5 - runtime (`make run`, `make run-nokvm`)
 
@@ -158,6 +181,10 @@ qemu-system-x86_64 -enable-kvm -cpu host -smp 4 -m 2G \
     -netdev user,id=net0,hostfwd=tcp:127.0.0.1:2222-:22 \
     -device e1000,netdev=net0 -nographic
 ```
+
+`make run` uses KVM when `/dev/kvm` is readable and writable, and falls back
+to `-cpu max` otherwise; `make run-nokvm` always runs without KVM. The overlay
+is removed when QEMU exits, so an aborted run does not leave it behind.
 
 The backing file must be an **absolute** path: `qemu-img` resolves a relative
 backing path against the directory of the overlay, so `-b img/hurd.base.qcow2`
@@ -310,6 +337,93 @@ Every one of these was hit while building this pipeline.
     directory. `nbdfuse` mounts a *file*, so the mount point to unmount is
     the file, not its directory.
 
+22. **The kernel file name must not be hardcoded.** The image ships
+    `/boot/gnumach-<version>-amd64-up.gz`, and the version changes with the
+    image. A hardcoded name produces an image that does not boot at all, with
+    an error that does not point at the cause. Fix: read the name from the
+    image and fail the preparation when no kernel is found.
+
+23. **A script that changes does not trigger a rebuild.** make only knows
+    about the files that are listed as prerequisites. Fix: the preparation
+    script is a prerequisite of the base image rule, so that changing it
+    rebuilds the base image.
+
+24. **The GRUB configuration of the image must not be written by hand.** The
+    module lines of the boot script define the task symbols that the other
+    lines refer to (`acpi-task`, `disk-task`, `fs-task`, `exec-task`). Leave
+    one of them out and the kernel panics with "bootstrap script missing
+    symbol" before the guest is up - the boot then hangs with the QEMU
+    process busy, and no login is possible. Fix: patch the configuration of
+    the image instead of replacing it.
+
+25. **The SSH connection dies together with the guest.** After `poweroff` the
+    connection is closed, so expect cannot wait for the exit status or for
+    the end of the file a second time; it fails with "spawn id exp3 not
+    open" and the provisioning is aborted even though the guest did all the
+    work. Fix: wait for the end of the file once and ignore the error when
+    the spawn is already closed (`catch { expect eof }`).
+
+26. **`$?` after `fi` is the status of the `if` statement, not of the failed
+    command.** The retry loop of the provisioning used
+
+    ```bash
+    if expect ...; then SSH_RC=0; break; fi
+    SSH_RC=$?
+    ```
+
+    The status of the `if` statement is 0 even when the condition failed, so
+    every failed login attempt looked like a success. After the last attempt
+    the script continued as if the guest had been provisioned and blocked
+    forever in `wait "$QEMU_PID"`, because the guest was still running. This
+    is what made a failed provisioning look like a dead, hanging QEMU job.
+    Fix: read the status inside the `else` branch, where it is still the
+    status of the condition. The expect script uses the exit status 2 for a
+    command that failed in the guest; that case is not retried, because the
+    same guest cannot fix it.
+
+27. **A long expect timeout hides a failed login.** The whole session had one
+    timeout of 3600 seconds, so a connection that was reset because sshd was
+    not up yet blocked for an hour instead of being retried. Fix: a short
+    timeout (120 s) for the login phase, a long one for the commands, and an
+    `eof` branch everywhere so that a closed connection ends the attempt
+    instead of waiting for the timeout.
+
+28. **Waiting for the guest to power off can block forever.** `wait "$QEMU_PID"`
+    returns only when QEMU exits, which never happens if the guest does not
+    shut down. Fix: wait in steps with a timeout, terminate QEMU when the
+    timeout is exceeded, and print the QEMU log.
+
+29. **The `hurd-dev` package of the sid archive cannot be unpacked.** The
+    upgrade of the image fails with dpkg error 100:
+
+    ```
+    dpkg: error processing archive .../hurd-dev_1%3a0.9.git20261028-4_hurd-amd64.deb (--unpack):
+     unable to install new version of './usr/share/libdde_linux26/build/include/linux-headers/linux/hdlc': No such file or directory
+    ```
+
+    The new version wants to replace the directory
+    `.../linux-headers/linux/hdlc` with a file, which dpkg cannot do on the
+    ext2 filesystem of the guest. It is not a timeout (`apt-get update`
+    takes 23 s and the upgrade downloads 185 MB before it fails), not caused
+    by the "unreleased" suite (the package comes from `sid/main`) and not
+    caused by the number of CPUs. `dpkg --force-overwrite` and
+    `apt-get -f -y install` fail in the same way. Fix: hold the package
+    (`apt-mark hold hurd-dev`), pin it below zero (`Pin-Priority: -1` in
+    `/etc/apt/preferences.d/99-hurd-dev`) and leave the upgrade disabled by
+    default (`RUN_APT_UPGRADE=0`).
+
+30. **The image enables an "unreleased" suite.** The
+    `/etc/apt/sources.list` of the shipped image contains
+
+    ```
+    deb http://deb.debian.org/debian-ports/ sid main
+    deb http://deb.debian.org/debian-ports/ unreleased main
+    ```
+
+    The packages of the "unreleased" suite are not stable. Fix: remove the
+    suite from the sources of the guest before `apt-get update` and verify
+    that no source mentions "unreleased" any more.
+
 ## Known issue: ext2 without a journal
 
 The root filesystem of the Hurd image is ext2 **without a journal**. The guest
@@ -347,7 +461,9 @@ needed.
    `make base && make provision`.
 4. Check whether the new image still ships `/etc/ssh/sshd_config.d/`, whether
    the `root` account is still in `/etc/shadow`, and whether the GRUB layout in
-   `prepare_base.sh` still matches the shipped `/boot/grub/grub.cfg`.
+   `prepare_base.sh` still matches the shipped `/boot/grub/grub.cfg`. The
+   kernel name is taken from the image, so a new kernel version needs no
+   change.
 
 ### Change the root password
 

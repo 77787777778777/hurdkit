@@ -45,7 +45,16 @@ fi
 # The password hash must use a crypt(3) method supported by the Hurd libc.
 # $6$ (SHA-512) is supported by glibc; yescrypt ($y$) is not, even though
 # /etc/login.defs names it as the preferred method.
-PASSWORD_HASH="$(openssl passwd -6 -salt hurdhurd "$ROOT_PASSWORD")"
+#
+# Each account gets its own random salt, so that two accounts with the same
+# password do not end up with the same hash. The password is passed through
+# standard input, so that it does not show up in the process list.
+password_hash() {
+    printf '%s' "$ROOT_PASSWORD" | openssl passwd -6 -stdin
+}
+
+ROOT_HASH="$(password_hash)"
+DEMO_HASH="$(password_hash)"
 
 TMP_DIR="$(mktemp -d)"
 # A dedicated mount point per run: a leftover FUSE mount from an earlier run
@@ -62,22 +71,6 @@ cleanup() {
     rm -rf "$TMP_DIR"
 }
 trap cleanup EXIT
-
-# --- New grub.cfg: serial console, auto-boot, no timeout ---
-cat > "$TMP_DIR/grub.cfg" <<'GRUBCFG'
-set default=0
-set timeout=0
-set terminal=console
-
-menuentry "GNU/Hurd" {
-    multiboot /boot/gnumach-1.8-amd64-up.gz root=part:2:device:wd0 console=com0
-    module /hurd/pci-arbiter.static pci-arbiter --host-priv-port='${host-port}' --device-master-port='${device-port}' --next-task='${acpi-task}' '$(pci-task=task-create)' '$(task-resume)'
-    module /hurd/acpi.static acpi --next-task='${disk-task}' '$(acpi-task=task-create)'
-    module /hurd/rumpdisk.static rumpdisk --next-task='${fs-task}' '$(disk-task=task-create)'
-    module /hurd/ext2fs.static ext2fs --multiboot-command-line='${kernel-command-line}' --exec-server-task='${exec-task}' -T typed '${root}' '$(fs-task=task-create)'
-    module /lib/ld-x86-64.so.1 exec /hurd/exec '$(exec-task=task-create)'
-}
-GRUBCFG
 
 # --- New /etc/default/grub: persistent serial console ---
 cat > "$TMP_DIR/default_grub" <<'GRUBDEF'
@@ -129,6 +122,57 @@ fi
 
 PART_FILE="$WORK_DIR/2"
 
+# --- Patch the GRUB configuration of the image ---
+# The shipped grub.cfg is patched instead of replaced: it knows the kernel
+# file, the translator modules and the filesystem UUID of the image, and
+# every symbol that the modules refer to has to be defined by exactly one
+# of them. Replacing the file risks dropping one of those definitions,
+# which makes the kernel panic with "bootstrap script missing symbol".
+#
+# Three things are changed:
+#   * the menu timeout becomes 0, so that the guest boots unattended,
+#   * the GRUB output goes to the console instead of the graphics console,
+#   * the Hurd console is put on the serial line.
+debugfs -R "dump /boot/grub/grub.cfg $TMP_DIR/grub.cfg.orig" "$PART_FILE" 2>/dev/null
+
+awk '
+    /^terminal_output gfxterm$/ { print "terminal_output console"; next }
+    /^[[:space:]]*set timeout=[0-9]+[[:space:]]*$/ {
+        match($0, /^[[:space:]]*/)
+        print substr($0, 1, RLENGTH) "set timeout=0"
+        next
+    }
+    /^[[:space:]]*multiboot/ && !/console=/ {
+        sub(/[[:space:]]+$/, "")
+        print $0 " console=com0"
+        next
+    }
+    { print }
+' "$TMP_DIR/grub.cfg.orig" > "$TMP_DIR/grub.cfg"
+
+# The patched configuration has to contain the settings the unattended
+# boot depends on; a configuration without them would boot into a menu or
+# into a console that cannot be reached.
+for pattern in '^[[:space:]]*set timeout=0$' '^terminal_output console$' 'console=com0'; do
+    if ! grep -q "$pattern" "$TMP_DIR/grub.cfg"; then
+        echo "Patched grub.cfg does not contain '$pattern'" >&2
+        exit 1
+    fi
+done
+
+# The kernel that the configuration refers to has to be in the image.
+KERNEL_PATH="$(awk '/^[[:space:]]*multiboot/ { for (i = 1; i < NF; i++) if ($i ~ /^\/boot\//) { print $i; exit } }' "$TMP_DIR/grub.cfg")"
+if [[ -z "$KERNEL_PATH" ]]; then
+    echo "No kernel found in the patched grub.cfg" >&2
+    exit 1
+fi
+if ! debugfs -R "stat $KERNEL_PATH" "$PART_FILE" 2>/dev/null | grep -q "Inode:"; then
+    echo "The kernel $KERNEL_PATH is not in the image" >&2
+    exit 1
+fi
+
+echo "Using kernel $KERNEL_PATH"
+
 # --- Patch /etc/shadow in place ---
 # The shipped file has one line per account and nine colon-separated
 # fields. Rewriting it from scratch drops the accounts and produces
@@ -137,24 +181,60 @@ PART_FILE="$WORK_DIR/2"
 # back with the original ownership and permissions.
 debugfs -R "dump /etc/shadow $TMP_DIR/shadow.orig" "$PART_FILE" 2>/dev/null
 
-awk -F: -v OFS=: -v hash="$PASSWORD_HASH" '
-    $1 == "root" || $1 == "demo" { $2 = hash }
+awk -F: -v OFS=: -v root_hash="$ROOT_HASH" -v demo_hash="$DEMO_HASH" '
+    $1 == "root" { $2 = root_hash }
+    $1 == "demo" { $2 = demo_hash }
     { print }
 ' "$TMP_DIR/shadow.orig" > "$TMP_DIR/shadow.new"
 
+# The rewritten file must keep every account and all nine fields. A file
+# with fewer accounts or with malformed entries breaks the login of every
+# user, so the result is checked before it is written into the image.
+ORIG_ACCOUNTS="$(grep -c '' "$TMP_DIR/shadow.orig")"
+NEW_ACCOUNTS="$(grep -c '' "$TMP_DIR/shadow.new")"
+if [[ "$ORIG_ACCOUNTS" != "$NEW_ACCOUNTS" ]]; then
+    echo "Account count changed while patching /etc/shadow ($ORIG_ACCOUNTS -> $NEW_ACCOUNTS)" >&2
+    exit 1
+fi
+
+BROKEN_LINES="$(awk -F: 'NF != 9 { count++ } END { print count + 0 }' "$TMP_DIR/shadow.new")"
+if [[ "$BROKEN_LINES" != "0" ]]; then
+    echo "$BROKEN_LINES lines of /etc/shadow do not have nine fields" >&2
+    exit 1
+fi
+
+for account in root demo; do
+    if ! awk -F: -v name="$account" -v root_hash="$ROOT_HASH" -v demo_hash="$DEMO_HASH" \
+        '$1 == name && $2 == (name == "root" ? root_hash : demo_hash) { found = 1 } END { exit !found }' "$TMP_DIR/shadow.new"; then
+        echo "Password hash for $account was not applied" >&2
+        exit 1
+    fi
+done
+
 # Build debugfs command script (no shell syntax, no comments)
 CMDS_FILE="$TMP_DIR/debugfs.cmds"
+
+# debugfs cannot overwrite a file, so an existing file has to be removed
+# first. The removal is only added for files that are really there, because
+# debugfs complains about missing files.
+remove_if_present() {
+    local path="$1"
+    if debugfs -R "stat $path" "$PART_FILE" 2>/dev/null | grep -q "Inode:"; then
+        echo "rm $path"
+    fi
+}
+
 {
-    echo "rm /boot/grub/grub.cfg"
+    remove_if_present /boot/grub/grub.cfg
     echo "write $TMP_DIR/grub.cfg /boot/grub/grub.cfg"
-    echo "rm /etc/default/grub"
+    remove_if_present /etc/default/grub
     echo "write $TMP_DIR/default_grub /etc/default/grub"
-    echo "rm /etc/shadow"
+    remove_if_present /etc/shadow
     echo "write $TMP_DIR/shadow.new /etc/shadow"
     echo "sif /etc/shadow mode 0100640"
     echo "sif /etc/shadow uid 0"
     echo "sif /etc/shadow gid 42"
-    echo "rm /etc/ssh/sshd_config.d/10-local.conf"
+    remove_if_present /etc/ssh/sshd_config.d/10-local.conf
     echo "write $TMP_DIR/sshd_local.conf /etc/ssh/sshd_config.d/10-local.conf"
     echo "sif /etc/ssh/sshd_config.d/10-local.conf mode 0100644"
     echo "sif /etc/ssh/sshd_config.d/10-local.conf uid 0"

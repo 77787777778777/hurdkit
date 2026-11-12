@@ -32,7 +32,7 @@ if [[ ! -f "$IMG" ]]; then
     exit 1
 fi
 
-for tool in qemu-nbd nbdfuse e2fsck qemu-img; do
+for tool in qemu-nbd nbdfuse e2fsck qemu-img jq; do
     if ! command -v "$tool" >/dev/null 2>&1; then
         echo "$tool is required to repair the filesystem" >&2
         exit 1
