@@ -1,5 +1,11 @@
 #!/usr/bin/env bash
-# Repair the ext2 root filesystem of a raw disk image offline.
+# Repair the ext2 root filesystem of a disk image without converting the
+# image to a raw file.
+#
+# The image is served by qemu-nbd, nbdfuse exposes that server as a plain
+# file, and partitionfs exposes the partitions of that file. e2fsck then
+# works directly on the partition file, and its writes travel through the
+# chain back into the original image.
 #
 # The GNU/Hurd root filesystem is ext2 without a journal. After the guest
 # has been running (package installation creates and removes a large number
@@ -11,58 +17,130 @@
 #   Inode bitmap differences: ...
 #
 # The metadata is intact, only the bookkeeping is stale, so e2fsck can
-# repair the image while it is not mounted. This is done after the guest
-# has powered off, before the image is used as the base disk.
+# repair the image while it is not mounted.
 #
-# Usage: repair_filesystem.sh <raw.img> [partition-number]
+# Usage: repair_filesystem.sh <image> [partition-number]
 
 set -euo pipefail
 
-IMG="${1:?Usage: $0 <raw.img> [partition-number]}"
+IMG="${1:?Usage: $0 <image> [partition-number]}"
 PART_NUM="${2:-2}"
-BLOCK_SIZE=512
+PARTFS="${PARTFS:-/home/chz/src/partitionfs/build/partitionfs}"
 
 if [[ ! -f "$IMG" ]]; then
     echo "Image not found: $IMG" >&2
     exit 1
 fi
 
-if ! command -v e2fsck >/dev/null 2>&1; then
-    echo "e2fsck is required to repair the filesystem" >&2
+for tool in qemu-nbd nbdfuse e2fsck qemu-img; do
+    if ! command -v "$tool" >/dev/null 2>&1; then
+        echo "$tool is required to repair the filesystem" >&2
+        exit 1
+    fi
+done
+
+if [[ ! -x "$PARTFS" ]]; then
+    echo "partitionfs binary not found or not executable: $PARTFS" >&2
     exit 1
 fi
 
-if ! command -v parted >/dev/null 2>&1; then
-    echo "parted is required to locate the partition" >&2
-    exit 1
-fi
-
-# Locate the partition: parted prints "number:start:end:size:..." in
-# machine-readable mode, with the sector counts suffixed by "s".
-PART_INFO="$(parted -s -m "$IMG" unit s print | awk -F: -v n="$PART_NUM" '$1 == n { print $2, $4; exit }')"
-
-if [[ -z "$PART_INFO" ]]; then
-    echo "Partition $PART_NUM not found in $IMG" >&2
-    exit 1
-fi
-
-START_SECTORS="${PART_INFO%% *}"
-SIZE_SECTORS="${PART_INFO##* }"
-START_SECTORS="${START_SECTORS%s}"
-SIZE_SECTORS="${SIZE_SECTORS%s}"
-
-if [[ -z "$START_SECTORS" || -z "$SIZE_SECTORS" ]]; then
-    echo "Could not parse partition geometry: $PART_INFO" >&2
-    exit 1
-fi
+# The image format is needed for qemu-nbd; the file name gives no hint.
+IMAGE_FORMAT="$(qemu-img info --output=json "$IMG" | jq -r '.format')"
 
 TMP_DIR="$(mktemp -d)"
-trap 'rm -rf "$TMP_DIR"' EXIT
-PART_FILE="$TMP_DIR/partition.img"
+MNT_DIR="$TMP_DIR/mnt"
+PART_DIR="$TMP_DIR/part"
+SOCKET="$TMP_DIR/nbd.sock"
+DISK_FILE="$MNT_DIR/disk.raw"
+PART_FILE="$PART_DIR/$PART_NUM"
+QEMU_NBD_PID=""
+NBDFUSE_PID=""
+PARTFS_PID=""
 
-echo "Repairing partition $PART_NUM (start $START_SECTORS, $SIZE_SECTORS sectors) of $IMG"
+# The FUSE daemons have to be stopped before their mount points can be
+# removed. A lazy unmount is the fallback when a file is still open.
+cleanup() {
+    if [[ -n "$PARTFS_PID" ]]; then
+        kill "$PARTFS_PID" 2>/dev/null || true
+        wait "$PARTFS_PID" 2>/dev/null || true
+    fi
+    fusermount3 -u "$PART_DIR" 2>/dev/null \
+        || fusermount -u "$PART_DIR" 2>/dev/null \
+        || fusermount3 -uz "$PART_DIR" 2>/dev/null \
+        || fusermount -uz "$PART_DIR" 2>/dev/null \
+        || true
 
-dd if="$IMG" of="$PART_FILE" bs="$BLOCK_SIZE" skip="$START_SECTORS" count="$SIZE_SECTORS" status=none
+    if [[ -n "$NBDFUSE_PID" ]]; then
+        kill "$NBDFUSE_PID" 2>/dev/null || true
+        wait "$NBDFUSE_PID" 2>/dev/null || true
+    fi
+    fusermount3 -u "$DISK_FILE" 2>/dev/null \
+        || fusermount -u "$DISK_FILE" 2>/dev/null \
+        || fusermount3 -uz "$DISK_FILE" 2>/dev/null \
+        || fusermount -uz "$DISK_FILE" 2>/dev/null \
+        || true
+
+    if [[ -n "$QEMU_NBD_PID" ]]; then
+        kill "$QEMU_NBD_PID" 2>/dev/null || true
+        wait "$QEMU_NBD_PID" 2>/dev/null || true
+    fi
+    rm -rf "$TMP_DIR"
+}
+trap cleanup EXIT
+
+mkdir -p "$MNT_DIR" "$PART_DIR"
+
+# Serve the image on a Unix socket.
+qemu-nbd -k "$SOCKET" -f "$IMAGE_FORMAT" "$IMG" > "$TMP_DIR/qemu-nbd.log" 2>&1 &
+QEMU_NBD_PID=$!
+
+for _ in $(seq 1 50); do
+    [[ -S "$SOCKET" ]] && break
+    sleep 0.2
+done
+
+if [[ ! -S "$SOCKET" ]]; then
+    echo "qemu-nbd did not create its socket" >&2
+    cat "$TMP_DIR/qemu-nbd.log" >&2
+    exit 1
+fi
+
+# Expose the served image as a file.
+nbdfuse "$DISK_FILE" --unix "$SOCKET" > "$TMP_DIR/nbdfuse.log" 2>&1 &
+NBDFUSE_PID=$!
+
+for _ in $(seq 1 50); do
+    [[ -f "$DISK_FILE" ]] && break
+    sleep 0.2
+done
+
+if [[ ! -f "$DISK_FILE" ]]; then
+    echo "nbdfuse did not create its file" >&2
+    cat "$TMP_DIR/nbdfuse.log" >&2
+    exit 1
+fi
+
+# Expose the partitions of that file.
+"$PARTFS" "$DISK_FILE" "$PART_DIR" > "$TMP_DIR/partitionfs.log" 2>&1 &
+PARTFS_PID=$!
+
+for _ in $(seq 1 50); do
+    [[ -f "$PART_FILE" ]] && break
+    if ! kill -0 "$PARTFS_PID" 2>/dev/null; then
+        echo "partitionfs exited during setup:" >&2
+        cat "$TMP_DIR/partitionfs.log" >&2
+        exit 1
+    fi
+    sleep 0.2
+done
+
+if [[ ! -f "$PART_FILE" ]]; then
+    echo "Partition $PART_NUM not found in $IMG" >&2
+    cat "$TMP_DIR/partitionfs.log" >&2
+    exit 1
+fi
+
+echo "Repairing partition $PART_NUM of $IMG"
 
 # -f: the filesystem is not mounted, but it carries the "needs recovery"
 # flag; -y: answer every question with yes so that the repair is not
@@ -79,11 +157,10 @@ if (( FSCK_RC & ~3 )); then
     exit 1
 fi
 
-# Write the repaired filesystem back into the disk image. conv=notrunc keeps
-# the rest of the image (partition table, swap, bootloader) untouched.
-dd if="$PART_FILE" of="$IMG" bs="$BLOCK_SIZE" seek="$START_SECTORS" count="$SIZE_SECTORS" conv=notrunc status=none
-
 # Verify the repaired filesystem.
 e2fsck -fn "$PART_FILE"
+
+# The writes have to reach the image before the daemons are stopped.
+sync
 
 echo "Filesystem repaired: $IMG"

@@ -168,12 +168,32 @@ pristine; all writes land in the overlay in `img/tmp/`.
 
 ### Offline filesystem repair (`scripts/repair_filesystem.sh`)
 
-`repair_filesystem.sh <raw.img> [partition]` locates the partition with
-`parted -s -m <img> unit s print`, extracts it with `dd`, runs `e2fsck -fy` on
-the extracted file and writes it back with `conv=notrunc`.
+`repair_filesystem.sh <image> [partition]` repairs the root filesystem of a
+disk image **without converting the image to a raw file**. The image is served
+by `qemu-nbd`, `nbdfuse` exposes that server as a plain file, `partitionfs`
+exposes the partitions of that file, and `e2fsck` works directly on the
+partition file. Its writes travel back through the chain into the original
+image:
 
-This step exists because of the "Known issue" below; it runs after the guest
-has powered off, while the image is not mounted.
+```
+qemu-nbd -k <socket> -f <format> <image>      # serve the image
+nbdfuse <mnt>/disk.raw --unix <socket>        # expose it as a file
+partitionfs <mnt>/disk.raw <partdir>          # expose its partitions
+e2fsck -fy <partdir>/2                        # repair through the chain
+```
+
+`nbdfuse` is the FUSE client of libnbd; it speaks the NBD protocol in
+userspace and needs neither the kernel NBD module nor root privileges. Only
+`/dev/fuse` is required. The image format is taken from `qemu-img info`, so
+the same script works for raw and qcow2 images.
+
+The repair needs the image not to be in use elsewhere, because `qemu-nbd`
+takes an exclusive lock on it. The provisioning works on a private copy of
+the base image, so this is never a problem.
+
+Measured on the Hurd image: the repair through the chain takes about 7
+seconds, while converting the 4 GB image to raw, extracting the partition,
+repairing it and converting everything back takes several minutes.
 
 ## Pitfalls
 
@@ -272,6 +292,24 @@ Every one of these was hit while building this pipeline.
     readiness test. Fix: retry the SSH login until it succeeds, which matters
     most without KVM, where the boot takes minutes.
 
+20. **Converting the image to raw is the slow part of the repair.** A
+    qcow2 -> raw conversion, a `dd` of the partition, the repair and the
+    conversion back move more than 20 GB through the disk. Fix: serve the
+    image with `qemu-nbd`, expose it with `nbdfuse` and its partitions with
+    `partitionfs`, and let `e2fsck` write through the chain (7 seconds
+    instead of minutes). The image format has to be passed to `qemu-nbd`
+    explicitly, and `nbdfuse` must be told which socket to use
+    (`--unix <socket>`); `qemu-nbd` has no socket activation mode, so the
+    socket is created with `-k <path>` and the server is stopped explicitly
+    when the repair is done.
+
+21. **A FUSE mount has to be unmounted before its directory can be removed.**
+    `fusermount3 -u` fails with "Device or resource busy" while the daemon
+    is still running. Fix: stop the daemon first, unmount the mount point
+    (`fusermount3 -uz` as a last resort), and only then remove the
+    directory. `nbdfuse` mounts a *file*, so the mount point to unmount is
+    the file, not its directory.
+
 ## Known issue: ext2 without a journal
 
 The root filesystem of the Hurd image is ext2 **without a journal**. The guest
@@ -295,8 +333,9 @@ Facts established while investigating this:
   `e2fsck -fy` repairs the image completely (a second `e2fsck -fn` then exits 0).
 
 That is why `scripts/provision_base.sh` repairs the filesystem offline after the
-guest has powered off. The repair needs the image as a raw file, so the
-provisioned copy is converted to raw, repaired, and converted back to qcow2.
+guest has powered off. The repair works on the image itself, through
+`qemu-nbd` -> `nbdfuse` -> `partitionfs`, so no conversion to a raw file is
+needed.
 
 ## How to update it
 
@@ -365,6 +404,13 @@ Check that the root filesystem of the base image is clean:
 qemu-img convert -f qcow2 -O raw img/hurd.base.qcow2 /tmp/base.raw
 dd if=/tmp/base.raw of=/tmp/base.p2.img bs=512 skip=1953792 count=6236160 status=none
 e2fsck -fn /tmp/base.p2.img      # expect exit status 0
+```
+
+The same check through the NBD chain, without the conversion (a few seconds
+instead of a minute):
+
+```
+bash scripts/repair_filesystem.sh img/hurd.base.qcow2   # also repairs
 ```
 
 Check that the base image survives a run unchanged:

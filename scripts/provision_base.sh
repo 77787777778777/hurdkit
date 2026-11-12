@@ -47,15 +47,12 @@ BASE_DIR="$(dirname "$BASE_IMG")"
 WORK_IMG="$(mktemp -p "$BASE_DIR" .provision.XXXXXX.qcow2)"
 QEMU_LOG="$(mktemp)"
 QEMU_PID=""
-REPAIR_RAW="$(mktemp -p "$BASE_DIR" .repair.XXXXXX.raw)"
-REPAIRED_IMG="$(mktemp -p "$BASE_DIR" .repaired.XXXXXX.qcow2)"
-rm -f "$REPAIR_RAW" "$REPAIRED_IMG"
 cleanup() {
     if [[ -n "$QEMU_PID" ]] && kill -0 "$QEMU_PID" 2>/dev/null; then
         kill "$QEMU_PID" 2>/dev/null || true
         wait "$QEMU_PID" 2>/dev/null || true
     fi
-    rm -f "$QEMU_LOG" "$WORK_IMG" "$REPAIR_RAW" "$REPAIRED_IMG"
+    rm -f "$QEMU_LOG" "$WORK_IMG"
 }
 trap cleanup EXIT
 
@@ -223,13 +220,10 @@ QEMU_PID=""
 
 # Repair the filesystem of the provisioned copy. The guest ran apt-get
 # upgrade, which created and removed thousands of files; without a journal
-# the shutdown leaves stale inode and block bitmaps behind. The repair is
-# done on the raw image and the result is converted back to qcow2.
-qemu-img convert -f qcow2 -O raw "$WORK_IMG" "$REPAIR_RAW"
-bash "$SCRIPT_DIR/repair_filesystem.sh" "$REPAIR_RAW"
-qemu-img convert -f raw -O qcow2 "$REPAIR_RAW" "$REPAIRED_IMG"
-mv -f "$REPAIRED_IMG" "$WORK_IMG"
-rm -f "$REPAIR_RAW"
+# the shutdown leaves stale inode and block bitmaps behind. The repair runs
+# on the image itself: qemu-nbd serves it, nbdfuse exposes it as a file and
+# partitionfs exposes the partition, so no conversion is needed.
+bash "$SCRIPT_DIR/repair_filesystem.sh" "$WORK_IMG"
 
 # Replace the base image with the provisioned copy.
 mv -f "$WORK_IMG" "$BASE_IMG"
