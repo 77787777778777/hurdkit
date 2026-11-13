@@ -51,9 +51,10 @@ The acceptance criteria for a finished image are:
 - Tool **not** available: `sudo`, `nbd`, `guestfish`, `virt-customize`, `socat`,
   `sshpass`. There is no root access, so loop mounts and libguestfs are out; the
   offline write path is `partitionfs` + `debugfs`.
-- `partitionfs` (FUSE, exposes the partitions of a disk image as files) is built
-  at `/home/chz/src/partitionfs/build/partitionfs`; the path is overridable with
-  the `PARTFS` environment variable.
+- `partitionfs` (FUSE, exposes the partitions of a disk image as files) is
+  built from the pinned checkout in `3p/partitionfs` with `make partitionfs-build`
+  and lands at `3p/partitionfs/build/partitionfs`; the path is overridable
+  with the `PARTFS` environment variable.
 - The Hurd sources are checked out next to the project in `hurd/`; read them
   (`hurd/ext2fs`, `hurd/libdiskfs`) when the behaviour of the translator matters.
 - KVM is available at `/dev/kvm`.

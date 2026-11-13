@@ -25,7 +25,11 @@ set -euo pipefail
 
 IMG="${1:?Usage: $0 <image> [partition-number]}"
 PART_NUM="${2:-2}"
-PARTFS="${PARTFS:-/home/chz/src/partitionfs/build/partitionfs}"
+# Default to the partitionfs built from the pinned 3p checkout
+# (make partitionfs-build); override with the PARTFS environment variable.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+PARTFS="${PARTFS:-$REPO_ROOT/3p/partitionfs/build/partitionfs}"
 
 if [[ ! -f "$IMG" ]]; then
     echo "Image not found: $IMG" >&2

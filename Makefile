@@ -49,7 +49,7 @@ RM            := rm -f
 LOCK          := flock
 LOCK_FILE     := $(IMG_DIR)/.build.lock
 
-.PHONY: all download check base provision run run-nokvm ssh ssh-peon clean distclean toolchain toolchain-clean toolchain-docker verify-vm hurd-build 9pfs fetch-3p
+.PHONY: all download check base provision run run-nokvm ssh ssh-peon clean distclean toolchain toolchain-clean toolchain-docker verify-vm hurd-build 9pfs fetch-3p partitionfs-build
 
 all: base
 
@@ -78,7 +78,7 @@ base: $(BASE_IMG)
 # interrupted build never leaves a partially written base image behind.
 # The preparation script is a prerequisite, so that changing it rebuilds
 # the base image.
-$(BASE_IMG): $(EXTRACT_STAMP) scripts/prepare_base.sh
+$(BASE_IMG): $(EXTRACT_STAMP) scripts/prepare_base.sh partitionfs-build
 	@$(MKDIR_P) $(IMG_DIR)
 	@$(LOCK) $(LOCK_FILE) sh -c 'set -e; \
 		ROOT_PASSWORD=$(ROOT_PASSWORD) bash scripts/prepare_base.sh $(RAW_IMG) $(WORK_IMG); \
@@ -87,7 +87,7 @@ $(BASE_IMG): $(EXTRACT_STAMP) scripts/prepare_base.sh
 		rm -f $(WORK_IMG)'
 
 # Provision the base image in-VM (idempotent: skips if already provisioned)
-provision: $(BASE_IMG)
+provision: $(BASE_IMG) partitionfs-build
 	@$(MKDIR_P) $(IMG_DIR)
 	@$(LOCK) $(LOCK_FILE) env ROOT_PASSWORD=$(ROOT_PASSWORD) \
 		CPU_COUNT=$(CPU_COUNT) MEMORY=$(MEMORY) \
@@ -169,7 +169,10 @@ ssh-peon:
             gnumach:https://git.savannah.gnu.org/git/hurd/gnumach.git \
             glibc:https://sourceware.org/git/glibc.git \
             hurd:https://github.com/joshumax/hurd.git \
-            9pfs:https://github.com/bugaevc/9pfs.git
+            9pfs:https://github.com/bugaevc/9pfs.git \
+            partitionfs:https://github.com/madscientist42/partitionfs.git
+PARTITIONFS_DIR := $(3P_DIR)/partitionfs
+PARTITIONFS     := $(PARTITIONFS_DIR)/build/partitionfs
 
 fetch-3p:
 	@set -e; \
@@ -196,6 +199,19 @@ fetch-3p:
 	else \
 		echo "fetch-3p: non-default 3P_DIR; pin the tree manually with 'make -C toolchain 3p-pin' after pointing 3p at it"; \
 	fi
+
+# Build the partitionfs FUSE filesystem from the pinned 3p checkout. The
+# image provisioning scripts expose the partitions of the disk image as
+# plain files through it (prepare_base.sh, repair_filesystem.sh); they
+# default to this binary. It is a host tool, not built with the Hurd
+# toolchain.
+partitionfs-build: fetch-3p
+	@command -v cmake >/dev/null || { echo "partitionfs-build: cmake is required" >&2; exit 1; }
+	@pkg-config --exists fuse || { echo "partitionfs-build: FUSE development files not found (pkg-config fuse; install e.g. libfuse-dev)" >&2; exit 1; }
+	@pkg-config --exists libparted || { echo "partitionfs-build: libparted development files not found (pkg-config libparted; install e.g. libparted-dev)" >&2; exit 1; }
+	cmake -S $(PARTITIONFS_DIR) -B $(PARTITIONFS_DIR)/build -DCMAKE_BUILD_TYPE=Release
+	cmake --build $(PARTITIONFS_DIR)/build
+	@test -x $(PARTITIONFS) && echo "partitionfs-build: $(PARTITIONFS)"
 
 # --- cross toolchain (delegates to toolchain/Makefile) ---
 toolchain: fetch-3p    ; $(MAKE) -C toolchain toolchain

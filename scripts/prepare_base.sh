@@ -20,7 +20,11 @@ set -euo pipefail
 SRC_IMG="${1:?Usage: $0 <source.raw> <work.raw> [root_password]}"
 WORK_IMG="${2:?Usage: $0 <source.raw> <work.raw> [root_password]}"
 ROOT_PASSWORD="${3:-abcdef}"
-PARTFS="${PARTFS:-/home/chz/src/partitionfs/build/partitionfs}"
+# Default to the partitionfs built from the pinned 3p checkout
+# (make partitionfs-build); override with the PARTFS environment variable.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+PARTFS="${PARTFS:-$REPO_ROOT/3p/partitionfs/build/partitionfs}"
 
 if [[ ! -f "$SRC_IMG" ]]; then
     echo "Source image not found: $SRC_IMG" >&2
