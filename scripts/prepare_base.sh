@@ -135,7 +135,10 @@ PART_FILE="$WORK_DIR/2"
 #   * the menu timeout becomes 0, so that the guest boots unattended,
 #   * the GRUB output goes to the console instead of the graphics console,
 #   * the Hurd console is put on the serial line.
-debugfs -R "dump /boot/grub/grub.cfg $TMP_DIR/grub.cfg.orig" "$PART_FILE" 2>/dev/null
+if ! debugfs -R "dump /boot/grub/grub.cfg $TMP_DIR/grub.cfg.orig" "$PART_FILE"; then
+    echo "debugfs: could not dump /boot/grub/grub.cfg from $PART_FILE" >&2
+    exit 1
+fi
 
 awk '
     /^terminal_output gfxterm$/ { print "terminal_output console"; next }
@@ -186,7 +189,10 @@ echo "Using kernel $KERNEL_PATH"
 # that the provisioning logs in with. The account of the image is renamed
 # during the provisioning, and its password is set there, after the
 # rename.
-debugfs -R "dump /etc/shadow $TMP_DIR/shadow.orig" "$PART_FILE" 2>/dev/null
+if ! debugfs -R "dump /etc/shadow $TMP_DIR/shadow.orig" "$PART_FILE"; then
+    echo "debugfs: could not dump /etc/shadow from $PART_FILE" >&2
+    exit 1
+fi
 
 awk -F: -v OFS=: -v root_hash="$ROOT_HASH" '
     $1 == "root" { $2 = root_hash }
