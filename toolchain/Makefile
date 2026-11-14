@@ -17,7 +17,7 @@ BACKEND   ?= hostlocal
 BINUTILS_VER := 2.46.1
 GCC_VER      := 15.3.0
 
-.PHONY: all toolchain toolchain-clean fetch binutils gcc1 gnumach glibc gcc2 mig hurd hurd-headers libpciaccess libtrivfs 9pfs verify-vm clean tooldir 3p-pin glibc-rebuild
+.PHONY: all toolchain toolchain-clean fetch binutils gcc1 gnumach glibc gcc2 mig hurd hurd-headers libpciaccess libtrivfs libirqhelp 9pfs verify-vm clean tooldir 3p-pin glibc-rebuild
 
 # The verified 3p checkouts, pinned to exact SHAs (see
 # stuff/crosscompile_plan.md, "3p source pins"). The shared 3p checkout is
@@ -84,7 +84,7 @@ all: toolchain
 
 ifeq ($(BACKEND),hostlocal)
 
-toolchain: 3p-pin fetch binutils gcc1 gnumach mig glibc gcc2 hurd libpciaccess libtrivfs 9pfs
+toolchain: 3p-pin fetch binutils gcc1 gnumach mig glibc gcc2 hurd libpciaccess libtrivfs libirqhelp 9pfs
 
 fetch: 3p-pin | $(SRC) $(BUILD)
 	cd $(SRC) && \
@@ -344,6 +344,29 @@ libtrivfs: hurd mig
 	fi
 	@echo "=== gate: libtrivfs ==="
 	ls $(PREFIX)/lib/libtrivfs.so $(PREFIX)/include/hurd/trivfs.h >/dev/null
+
+libirqhelp: hurd mig
+	@if ls $(PREFIX)/lib/libirqhelp.so >/dev/null 2>&1; then \
+	    echo "(skipping: libirqhelp already installed)"; \
+	else \
+	    rm -rf $(BUILD)/hurd-src $(BUILD)/hurd && \
+	    cp -a $(REPO_ROOT)/3p/hurd $(BUILD)/hurd-src && \
+	    cd $(BUILD)/hurd-src && \
+	    sed -i -e '/^if test "x$$cross_compiling" = "xyes"; then$$/,/^fi$$/d' configure.ac && \
+	    autoreconf -i && \
+	    export PATH=$(PREFIX)/bin:$$PATH && \
+	    mkdir -p $(BUILD)/hurd && cd $(BUILD)/hurd && \
+	    CC=$(PREFIX)/bin/x86_64-gnu-gcc MIG=$(PREFIX)/bin/mig \
+	    CPPFLAGS="-I$(PREFIX)/include" LDFLAGS="-L$(PREFIX)/lib" CPATH=$(PREFIX)/include \
+	    $(BUILD)/hurd-src/configure \
+	        --host=x86_64-gnu --build=x86_64-pc-linux-gnu --prefix=$(PREFIX) \
+	        --without-parted --without-libtirpc --without-libdaemon \
+	        --without-rump --without-acpica --without-libcrypt --disable-profile && \
+	    make -C libirqhelp && \
+	    make -C libirqhelp install; \
+	fi
+	@echo "=== gate: libirqhelp ==="
+	ls $(PREFIX)/lib/libirqhelp.so $(PREFIX)/include/hurd/irqhelp.h >/dev/null
 
 # 9pfs calls two RPC stubs directly: exec_exec_paths (file-exec-paths.c,
 # from libhurduser) and mach_port_move_member (io-reauthenticate.c, from
