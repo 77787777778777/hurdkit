@@ -20,6 +20,22 @@ Host tools for the image pipeline: `make`, `wget`, `tar`, `xz`, `qemu-system-x86
 
 Toolchain builds download `binutils` and `gcc` source tarballs from ftp.gnu.org and install into `$HOME/opt/x86_64-gnu` (build artifacts under `$HOME/work/x86_64-gnu-*`).
 
+### Nix / NixOS
+
+The flake lives in `nix/` and provides a development shell with every host tool listed above, for the image pipeline and for the host-local toolchain build. It follows `nixos-unstable`:
+
+```sh
+nix develop ./nix   # or: direnv allow  (the .envrc points at ./nix)
+make base
+```
+
+Two things are worth knowing, because each of them fails in a confusing way otherwise:
+
+* `nbdfuse` mounts through the setuid `fusermount3`, which on NixOS lives in `/run/wrappers/bin`. The shell puts that directory first in `PATH`, because the `fusermount3` of the `fuse3` package in the Nix store is not setuid ("Operation not permitted").
+* The shell disables the hardening flags of the nixpkgs compiler wrapper (`hardeningDisable = [ "all" ]`); GCC and glibc do not build with them.
+
+The Docker backend (`make toolchain-docker`) is not covered by the shell; it needs a `docker` command on the host.
+
 The 3p source checkouts (`mig`, `gnumach`, `glibc`, `hurd`, `9pfs`, `libpciaccess`) are pinned to verified commits. The image pipeline needs none of them; they are fetched by `make toolchain` via `fetch-3p`. `make -C toolchain ...` assumes `3p/` is already present.
 
 ## Main targets
@@ -56,6 +72,7 @@ Tunables (image version, URL, MD5, memory, CPU count, SSH port, root password, g
 
 ```
 Makefile              # image pipeline + toolchain entry points
+nix/                  # flake.nix + flake.lock (development shell)
 toolchain/            # cross toolchain orchestration (host-local and docker backends)
 scripts/              # prepare_base.sh, provision_base.sh, provision_guest.py, repair_filesystem.sh, partition.sh
 skills/BOOT.md        # detailed boot/provisioning skill
