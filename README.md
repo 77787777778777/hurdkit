@@ -60,11 +60,12 @@ Makefile              # image pipeline + toolchain entry points
 toolchain/            # cross toolchain orchestration (host-local and docker backends)
 scripts/              # prepare_base.sh, provision_base.sh, provision_guest.py, repair_filesystem.sh
 skills/BOOT.md        # detailed boot/provisioning skill
+skills/CROSS_TESTING.md  # test cross-compiled drivers inside the Hurd VM
 img/                  # downloaded image, base image, keys (git ignored)
 3p/                   # pinned 3p source checkouts (git ignored)
 ```
 
-See `toolchain/README.md` for toolchain build details and `skills/BOOT.md` for the boot/provisioning procedure.
+See `toolchain/README.md` for toolchain build details, `skills/BOOT.md` for the boot/provisioning procedure, and `skills/CROSS_TESTING.md` for testing cross-compiled drivers in the guest.
 
 ## Quick start
 

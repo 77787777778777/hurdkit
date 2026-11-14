@@ -388,7 +388,7 @@ verify-vm: 9pfs
 	ssh -p 2222 -i $(REPO_ROOT)/img/keys/root_ed25519 -o StrictHostKeyChecking=accept-new \
 	    root@127.0.0.1 '/tmp/9pfs --version'
 	ssh -p 2222 -i $(REPO_ROOT)/img/keys/root_ed25519 -o StrictHostKeyChecking=accept-new \
-	    root@127.0.0.1 '/tmp/9pfs --help | head -5'
+	    root@127.0.0.1 '/tmp/9pfs --help; echo EXIT=$$?'
 
 clean:
 	rm -rf $(BUILD)/*
