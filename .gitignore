@@ -2,3 +2,6 @@ toolchain/*.log
 img/
 3p
 __pycache__/
+.direnv/
+result
+result-*
