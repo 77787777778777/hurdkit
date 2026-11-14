@@ -170,7 +170,8 @@ ssh-peon:
             glibc:https://sourceware.org/git/glibc.git \
             hurd:https://github.com/joshumax/hurd.git \
             9pfs:https://github.com/bugaevc/9pfs.git \
-            partitionfs:https://github.com/madscientist42/partitionfs.git
+            partitionfs:https://github.com/madscientist42/partitionfs.git \
+            libpciaccess:https://gitlab.freedesktop.org/xorg/lib/libpciaccess.git
 PARTITIONFS_DIR := $(3P_DIR)/partitionfs
 PARTITIONFS     := $(PARTITIONFS_DIR)/build/partitionfs
 

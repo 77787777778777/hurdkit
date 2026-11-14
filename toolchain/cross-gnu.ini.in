@@ -1,0 +1,24 @@
+# Meson cross file for the GNU/Hurd target.
+#
+# 'gnu' is what selects libpciaccess' Hurd backend (src/hurd_pci.c) and the
+# machuser/hurduser libraries that backend needs (meson.build, the
+# host_machine.system() == 'gnu' branch).
+#
+# @PREFIX@ is replaced with the toolchain prefix by the build rule.
+[binaries]
+c = '@PREFIX@/bin/x86_64-gnu-gcc'
+ar = '@PREFIX@/bin/x86_64-gnu-ar'
+strip = '@PREFIX@/bin/x86_64-gnu-strip'
+ld = '@PREFIX@/bin/x86_64-gnu-ld'
+
+[host_machine]
+system = 'gnu'
+kernel = 'hurd'
+cpu_family = 'x86_64'
+cpu = 'x86_64'
+endian = 'little'
+
+[properties]
+# The Hurd binaries cannot run on the build host, so meson must not try to
+# execute them to probe their properties.
+needs_exe_wrapper = true

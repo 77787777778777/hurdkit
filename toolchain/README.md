@@ -10,6 +10,7 @@ toolchain under the Hurd VM. Full recipe: `stuff/crosscompile_plan.md`.
 |---|---|
 | `Dockerfile.hurd-x86_64-gnu` | Single-stage Docker builder (debian:trixie) |
 | `Makefile` | Orchestrates both backends behind one UX |
+| `cross-gnu.ini.in` | Meson cross-file template for the GNU/Hurd target (`@PREFIX@` substituted at build time) |
 | `9p-server.py` | Optional python 9P2000.L server for the V5 mount test |
 | `.dockerignore` | Keeps the Docker build context to this directory only |
 
@@ -20,6 +21,7 @@ Host-local (default):
 ```sh
 make -C toolchain toolchain          # stages 0–8: fetch … 9pfs
 make -C toolchain 9pfs               # build just the verification ELF
+make -C toolchain libpciaccess       # cross-build libpciaccess (GNU/Hurd target)
 make -C toolchain verify-vm          # V2–V4 against the Hurd VM
 ```
 
@@ -30,8 +32,8 @@ them to the verified commits. `make -C toolchain ...` (this directory)
 assumes `3p/` is present.
 
 The 3p sources the toolchain builds against (`mig`, `glibc`, `gnumach`,
-`hurd`, `9pfs`) are pinned to the exact commits that were verified for
-this build; `3p/9pfs` is pristine upstream master (the extra link
+`hurd`, `9pfs`, `libpciaccess`) are pinned to the exact commits that were
+verified for this build; `3p/9pfs` is pristine upstream master (the extra link
 libraries it needs are passed from the wrapper, not patched in).
 `make -C toolchain 3p-pin` checks them out — it runs automatically
 before any build, refuses to proceed when a repo has uncommitted changes,

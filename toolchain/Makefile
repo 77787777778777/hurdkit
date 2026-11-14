@@ -17,7 +17,7 @@ BACKEND   ?= hostlocal
 BINUTILS_VER := 2.46.1
 GCC_VER      := 15.3.0
 
-.PHONY: all toolchain toolchain-clean fetch binutils gcc1 gnumach glibc gcc2 mig hurd hurd-headers 9pfs verify-vm clean tooldir 3p-pin glibc-rebuild
+.PHONY: all toolchain toolchain-clean fetch binutils gcc1 gnumach glibc gcc2 mig hurd hurd-headers libpciaccess 9pfs verify-vm clean tooldir 3p-pin glibc-rebuild
 
 # The verified 3p checkouts, pinned to exact SHAs (see
 # stuff/crosscompile_plan.md, "3p source pins"). The shared 3p checkout is
@@ -25,12 +25,22 @@ GCC_VER      := 15.3.0
 # before either backend builds. The 9pfs pin is pristine upstream master.
 # partitionfs is an image-pipeline tool (not used by the toolchain itself),
 # pinned here so the same checkout policy covers everything under 3p/.
+# libpciaccess is pinned to the upstream X.Org master commit that adds the
+# GNU/Hurd build fix; it is fetched from the upstream GitLab repository
+# because the GitHub mirror stops before that commit (see 3P_PIN_REMOTES).
 3P_PINS := mig:cb48044b30fcfe10529ecc1129dd68e93ed73835 \
            glibc:03628c2f85acaab6ef71c37c954fd0707685e0f0 \
            gnumach:12a3efa846b574070f90aa0c22c3f3e67cca10c4 \
            hurd:9b556c6ad91197125bff8261462f51b024ad8e00 \
            9pfs:b5b23deb1df6eb383fd2c0f5271c068861b745a8 \
-           partitionfs:1da79f0d12383dab960ca9b2a5b60f4ee738a2a2
+           partitionfs:1da79f0d12383dab960ca9b2a5b60f4ee738a2a2 \
+           libpciaccess:e33aa5fd28f63b9842e36c1a8a954577eec042e3
+
+# Where the pinned commit of a repo is fetched from, when it is not reachable
+# in the checkout's 'origin'. The GitHub mirror of libpciaccess lags upstream
+# X.Org master and does not contain the GNU/Hurd fix, so its pinned commit is
+# fetched directly from the upstream repository.
+3P_PIN_REMOTES := libpciaccess:https://gitlab.freedesktop.org/xorg/lib/libpciaccess.git
 
 # Pin the 3p repos to the verified SHAs. No-op when already pinned. Refuses
 # to proceed if a repo has uncommitted changes (it may be shared with other
@@ -40,12 +50,16 @@ GCC_VER      := 15.3.0
 	@set -e; \
 	for spec in $(3P_PINS); do \
 	    repo=$${spec%%:*}; sha=$${spec#*:}; dir=$(REPO_ROOT)/3p/$$repo; \
+	    remote=origin; \
+	    for rs in $(3P_PIN_REMOTES); do \
+	        if [ "$${rs%%:*}" = "$$repo" ]; then remote=$${rs#*:}; fi; \
+	    done; \
 	    git -C $$dir rev-parse --git-dir >/dev/null 2>&1 || { \
 	        echo "3p-pin: $$dir is not a git repo"; exit 1; \
 	    }; \
 	    if ! git -C $$dir cat-file -e $$sha^{commit} 2>/dev/null; then \
-	        echo "3p-pin: $$repo: pinned commit $$sha not present locally; fetching"; \
-	        git -C $$dir fetch origin $$sha || { \
+	        echo "3p-pin: $$repo: pinned commit $$sha not present locally; fetching from $$remote"; \
+	        git -C $$dir fetch $$remote $$sha || { \
 	            echo "3p-pin: fetch failed for $$repo; restore the pinned 3p checkout"; \
 	            exit 1; \
 	        }; \
@@ -70,7 +84,7 @@ all: toolchain
 
 ifeq ($(BACKEND),hostlocal)
 
-toolchain: 3p-pin fetch binutils gcc1 gnumach mig glibc gcc2 hurd 9pfs
+toolchain: 3p-pin fetch binutils gcc1 gnumach mig glibc gcc2 hurd libpciaccess 9pfs
 
 fetch: 3p-pin | $(SRC) $(BUILD)
 	cd $(SRC) && \
@@ -271,6 +285,39 @@ hurd: mig glibc
 	@echo "=== gate: hurd libraries ==="
 	ls $(PREFIX)/lib/libshouldbeinlibc.so $(PREFIX)/include/hurd/io.h >/dev/null
 
+# libpciaccess is built with meson, not autotools. The GNU/Hurd backend is
+# selected by the cross file's system = 'gnu'; the pinned upstream commit
+# (e33aa5fd) adds the machuser/hurduser libraries that backend needs.
+# zlib is disabled: the translator does not read compressed pci.ids, and the
+# host's zlib is a Linux build that must not end up in a Hurd binary.
+libpciaccess: hurd
+	@command -v meson >/dev/null 2>&1 || { \
+	    echo "libpciaccess: meson is required on the host"; exit 1; \
+	}
+	@command -v ninja >/dev/null 2>&1 || { \
+	    echo "libpciaccess: ninja is required on the host"; exit 1; \
+	}
+	@if ls $(PREFIX)/lib/libpciaccess.so >/dev/null 2>&1; then \
+	    echo "(skipping: libpciaccess already installed)"; \
+	else \
+	    test -f $(PREFIX)/include/hurd/pci.h || \
+	        cp -f $(REPO_ROOT)/3p/hurd/hurd/pci.h $(PREFIX)/include/hurd/; \
+	    rm -rf $(BUILD)/libpciaccess && mkdir -p $(BUILD)/libpciaccess/build && \
+	    sed -e "s|@PREFIX@|$(PREFIX)|g" $(REPO_ROOT)/toolchain/cross-gnu.ini.in \
+	        > $(BUILD)/libpciaccess/cross.ini && \
+	    meson setup $(BUILD)/libpciaccess/build $(REPO_ROOT)/3p/libpciaccess \
+	        --cross-file $(BUILD)/libpciaccess/cross.ini \
+	        -Dzlib=disabled -Dprefix=$(PREFIX) -Dlibdir=lib && \
+	    meson compile -C $(BUILD)/libpciaccess/build && \
+	    meson install -C $(BUILD)/libpciaccess/build && \
+	    rm -rf $(BUILD)/libpciaccess; \
+	fi
+	@echo "=== gate: libpciaccess ==="
+	ls $(PREFIX)/lib/libpciaccess.so $(PREFIX)/include/pciaccess.h \
+	    $(PREFIX)/lib/pkgconfig/pciaccess.pc >/dev/null
+	$(PREFIX)/bin/x86_64-gnu-readelf -d $(PREFIX)/lib/libpciaccess.so.0 \
+	    | grep -E "NEEDED.*(machuser|hurduser)"
+
 # 9pfs calls two RPC stubs directly: exec_exec_paths (file-exec-paths.c,
 # from libhurduser) and mach_port_move_member (io-reauthenticate.c, from
 # libmachuser). libc NEEDs both DSOs, so the loader finds them at run time;
@@ -331,7 +378,7 @@ toolchain: 3p-pin Dockerfile.hurd-x86_64-gnu docker-stages.sh
 binutils gcc1 gcc2 gnumach mig glibc: toolchain
 	@echo "stages $@ are run by the container above (binutils -> gcc2, incl. MIG)"
 
-hurd 9pfs verify-vm: toolchain
+hurd libpciaccess 9pfs verify-vm: toolchain
 	@echo "stage $@ is not implemented in the docker backend yet;"
 	@echo "run it host-local: make -C toolchain $@ BACKEND=hostlocal"
 	@echo "(MIG, the Hurd headers and glibc are installed in the prefix;"
