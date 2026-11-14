@@ -10,17 +10,17 @@ The top-level Makefile downloads a pinned Debian GNU/Hurd image, prepares it off
 download -> offline preparation -> qcow2 base -> in-VM provisioning -> overlay boot
 ```
 
-It also builds a cross toolchain (binutils, gcc stage 1/2, gnumach, MIG, glibc, Hurd libs, 9pfs) for `x86_64-gnu` on a Linux host (host-local or via Docker), and builds the `partitionfs` FUSE tool used by the image pipeline.
+It also builds a cross toolchain (binutils, gcc stage 1/2, gnumach, MIG, glibc, Hurd libs, 9pfs) for `x86_64-gnu` on a Linux host (host-local or via Docker).
 
 The Debian GNU/Hurd image is pinned to version `20260314` (see `VERSION` in the Makefile).
 
 ## Requirements
 
-Host tools: `make`, `wget`, `tar`, `xz`, `qemu-img`, `qemu-system-x86_64`, `flock`, `openssl`, `cmake`, `pkg-config`, plus FUSE and libparted development files (for `partitionfs-build`). KVM (`/dev/kvm`) is used for acceleration when available; the VM boots without it otherwise.
+Host tools for the image pipeline: `make`, `wget`, `tar`, `xz`, `qemu-system-x86_64`, `qemu-img` and `qemu-nbd` (QEMU), `flock` and `partx` (util-linux), `debugfs` and `e2fsck` (e2fsprogs), `nbdfuse` (libnbd), `openssl`, `ssh` and `ssh-keygen`, and `python3` with the `pexpect` module. Nothing has to be compiled on the host, and no root privileges are needed. KVM (`/dev/kvm`) is used for acceleration when available; the VM boots without it otherwise. FUSE (`/dev/fuse` and a setuid `fusermount3`) is used by `make provision` only, for the offline repair of the qcow2 image.
 
 Toolchain builds download `binutils` and `gcc` source tarballs from ftp.gnu.org and install into `$HOME/opt/x86_64-gnu` (build artifacts under `$HOME/work/x86_64-gnu-*`).
 
-The 3p source checkouts (`mig`, `gnumach`, `glibc`, `hurd`, `9pfs`, `partitionfs`, `libpciaccess`) are pinned to verified commits. Only `partitionfs` is needed for the image pipeline (`make base` fetches and builds just that checkout); the remaining checkouts are fetched by `make toolchain` via `fetch-3p`. `make -C toolchain ...` assumes `3p/` is already present.
+The 3p source checkouts (`mig`, `gnumach`, `glibc`, `hurd`, `9pfs`, `libpciaccess`) are pinned to verified commits. The image pipeline needs none of them; they are fetched by `make toolchain` via `fetch-3p`. `make -C toolchain ...` assumes `3p/` is already present.
 
 ## Main targets
 
@@ -32,7 +32,6 @@ The 3p source checkouts (`mig`, `gnumach`, `glibc`, `hurd`, `9pfs`, `partitionfs
 | `make ssh` / `make ssh-peon` | SSH into the running VM (port 2222) |
 | `make toolchain` | Build the x86_64-gnu cross toolchain |
 | `make toolchain-docker` | Same via Docker |
-| `make partitionfs-build` | Build the partitionfs FUSE tool (fetches only the partitionfs 3p checkout) |
 | `make fetch-3p` | Clone missing 3p source checkouts |
 | `make clean` / `make distclean` | Remove temporaries / all generated files |
 
@@ -58,7 +57,7 @@ Tunables (image version, URL, MD5, memory, CPU count, SSH port, root password, g
 ```
 Makefile              # image pipeline + toolchain entry points
 toolchain/            # cross toolchain orchestration (host-local and docker backends)
-scripts/              # prepare_base.sh, provision_base.sh, provision_guest.py, repair_filesystem.sh
+scripts/              # prepare_base.sh, provision_base.sh, provision_guest.py, repair_filesystem.sh, partition.sh
 skills/BOOT.md        # detailed boot/provisioning skill
 skills/CROSS_TESTING.md  # test cross-compiled drivers inside the Hurd VM
 img/                  # downloaded image, base image, keys (git ignored)

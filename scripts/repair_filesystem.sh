@@ -2,10 +2,12 @@
 # Repair the ext2 root filesystem of a disk image without converting the
 # image to a raw file.
 #
-# The image is served by qemu-nbd, nbdfuse exposes that server as a plain
-# file, and partitionfs exposes the partitions of that file. e2fsck then
-# works directly on the partition file, and its writes travel through the
-# chain back into the original image.
+# The image is served by qemu-nbd, and nbdfuse exposes that server as a
+# plain file with the raw content of the disk. e2fsck opens the partition
+# inside that file by its byte offset ("FILE?offset=BYTES", see
+# scripts/partition.sh), and its writes travel through the chain back into
+# the original image. A raw image needs no chain at all: e2fsck opens the
+# partition inside the image file itself.
 #
 # The GNU/Hurd root filesystem is ext2 without a journal. After the guest
 # has been running (package installation creates and removes a large number
@@ -25,28 +27,21 @@ set -euo pipefail
 
 IMG="${1:?Usage: $0 <image> [partition-number]}"
 PART_NUM="${2:-2}"
-# Default to the partitionfs built from the pinned 3p checkout
-# (make partitionfs-build); override with the PARTFS environment variable.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-PARTFS="${PARTFS:-$REPO_ROOT/3p/partitionfs/build/partitionfs}"
+# shellcheck source=scripts/partition.sh
+source "$SCRIPT_DIR/partition.sh"
 
 if [[ ! -f "$IMG" ]]; then
     echo "Image not found: $IMG" >&2
     exit 1
 fi
 
-for tool in qemu-nbd nbdfuse e2fsck qemu-img; do
+for tool in e2fsck qemu-img partx; do
     if ! command -v "$tool" >/dev/null 2>&1; then
         echo "$tool is required to repair the filesystem" >&2
         exit 1
     fi
 done
-
-if [[ ! -x "$PARTFS" ]]; then
-    echo "partitionfs binary not found or not executable: $PARTFS" >&2
-    exit 1
-fi
 
 # The image format is needed for qemu-nbd; the file name gives no hint.
 # The format is parsed from the plain output instead of the JSON output,
@@ -59,36 +54,26 @@ fi
 
 TMP_DIR="$(mktemp -d)"
 MNT_DIR="$TMP_DIR/mnt"
-PART_DIR="$TMP_DIR/part"
 SOCKET="$TMP_DIR/nbd.sock"
-DISK_FILE="$MNT_DIR/disk.raw"
-PART_FILE="$PART_DIR/$PART_NUM"
 QEMU_NBD_PID=""
 NBDFUSE_PID=""
-PARTFS_PID=""
+# The file with the raw content of the disk: the image itself when it is a
+# raw image, the file that nbdfuse exposes otherwise.
+DISK_FILE=""
 
-# The FUSE daemons have to be stopped before their mount points can be
-# removed. A lazy unmount is the fallback when a file is still open.
+# The FUSE daemon has to be stopped before its mount point can be removed.
+# nbdfuse mounts a file, so the mount point is the file, not its directory.
+# A lazy unmount is the fallback when the file is still open.
 cleanup() {
-    if [[ -n "$PARTFS_PID" ]]; then
-        kill "$PARTFS_PID" 2>/dev/null || true
-        wait "$PARTFS_PID" 2>/dev/null || true
-    fi
-    fusermount3 -u "$PART_DIR" 2>/dev/null \
-        || fusermount -u "$PART_DIR" 2>/dev/null \
-        || fusermount3 -uz "$PART_DIR" 2>/dev/null \
-        || fusermount -uz "$PART_DIR" 2>/dev/null \
-        || true
-
     if [[ -n "$NBDFUSE_PID" ]]; then
         kill "$NBDFUSE_PID" 2>/dev/null || true
         wait "$NBDFUSE_PID" 2>/dev/null || true
+        fusermount3 -u "$MNT_DIR/disk.raw" 2>/dev/null \
+            || fusermount -u "$MNT_DIR/disk.raw" 2>/dev/null \
+            || fusermount3 -uz "$MNT_DIR/disk.raw" 2>/dev/null \
+            || fusermount -uz "$MNT_DIR/disk.raw" 2>/dev/null \
+            || true
     fi
-    fusermount3 -u "$DISK_FILE" 2>/dev/null \
-        || fusermount -u "$DISK_FILE" 2>/dev/null \
-        || fusermount3 -uz "$DISK_FILE" 2>/dev/null \
-        || fusermount -uz "$DISK_FILE" 2>/dev/null \
-        || true
 
     if [[ -n "$QEMU_NBD_PID" ]]; then
         kill "$QEMU_NBD_PID" 2>/dev/null || true
@@ -98,55 +83,55 @@ cleanup() {
 }
 trap cleanup EXIT
 
-mkdir -p "$MNT_DIR" "$PART_DIR"
+if [[ "$IMAGE_FORMAT" == "raw" ]]; then
+    # A raw image is the disk content already.
+    DISK_FILE="$IMG"
+else
+    for tool in qemu-nbd nbdfuse; do
+        if ! command -v "$tool" >/dev/null 2>&1; then
+            echo "$tool is required to repair a $IMAGE_FORMAT image" >&2
+            exit 1
+        fi
+    done
 
-# Serve the image on a Unix socket.
-qemu-nbd -k "$SOCKET" -f "$IMAGE_FORMAT" "$IMG" > "$TMP_DIR/qemu-nbd.log" 2>&1 &
-QEMU_NBD_PID=$!
+    mkdir -p "$MNT_DIR"
+    DISK_FILE="$MNT_DIR/disk.raw"
 
-for _ in $(seq 1 50); do
-    [[ -S "$SOCKET" ]] && break
-    sleep 0.2
-done
+    # Serve the image on a Unix socket.
+    qemu-nbd -k "$SOCKET" -f "$IMAGE_FORMAT" "$IMG" > "$TMP_DIR/qemu-nbd.log" 2>&1 &
+    QEMU_NBD_PID=$!
 
-if [[ ! -S "$SOCKET" ]]; then
-    echo "qemu-nbd did not create its socket" >&2
-    cat "$TMP_DIR/qemu-nbd.log" >&2
-    exit 1
-fi
+    for _ in $(seq 1 50); do
+        [[ -S "$SOCKET" ]] && break
+        sleep 0.2
+    done
 
-# Expose the served image as a file.
-nbdfuse "$DISK_FILE" --unix "$SOCKET" > "$TMP_DIR/nbdfuse.log" 2>&1 &
-NBDFUSE_PID=$!
-
-for _ in $(seq 1 50); do
-    [[ -f "$DISK_FILE" ]] && break
-    sleep 0.2
-done
-
-if [[ ! -f "$DISK_FILE" ]]; then
-    echo "nbdfuse did not create its file" >&2
-    cat "$TMP_DIR/nbdfuse.log" >&2
-    exit 1
-fi
-
-# Expose the partitions of that file.
-"$PARTFS" "$DISK_FILE" "$PART_DIR" > "$TMP_DIR/partitionfs.log" 2>&1 &
-PARTFS_PID=$!
-
-for _ in $(seq 1 50); do
-    [[ -f "$PART_FILE" ]] && break
-    if ! kill -0 "$PARTFS_PID" 2>/dev/null; then
-        echo "partitionfs exited during setup:" >&2
-        cat "$TMP_DIR/partitionfs.log" >&2
+    if [[ ! -S "$SOCKET" ]]; then
+        echo "qemu-nbd did not create its socket" >&2
+        cat "$TMP_DIR/qemu-nbd.log" >&2
         exit 1
     fi
-    sleep 0.2
-done
 
-if [[ ! -f "$PART_FILE" ]]; then
+    # Expose the served image as a file.
+    nbdfuse "$DISK_FILE" --unix "$SOCKET" > "$TMP_DIR/nbdfuse.log" 2>&1 &
+    NBDFUSE_PID=$!
+
+    for _ in $(seq 1 50); do
+        [[ -f "$DISK_FILE" ]] && break
+        sleep 0.2
+    done
+
+    if [[ ! -f "$DISK_FILE" ]]; then
+        echo "nbdfuse did not create its file" >&2
+        cat "$TMP_DIR/nbdfuse.log" >&2
+        exit 1
+    fi
+fi
+
+# The name under which e2fsck opens the partition inside the disk file:
+# "<disk file>?offset=<byte offset of the partition>".
+if ! PART_FILE="$(partition_target "$DISK_FILE" "$PART_NUM")"; then
     echo "Partition $PART_NUM not found in $IMG" >&2
-    cat "$TMP_DIR/partitionfs.log" >&2
     exit 1
 fi
 
