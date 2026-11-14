@@ -24,9 +24,7 @@ GCC_VER      := 15.3.0
 # mounted read-only by the docker backend, so the pin is applied on the host
 # before either backend builds. The 9pfs pin is pristine upstream master.
 # The 3p source URLs and verified pins live in toolchain/pins.mk, shared
-# with the top-level Makefile (image pipeline). The partitionfs pin there
-# covers the image-pipeline checkout; the remaining pins cover the cross
-# toolchain.
+# with the top-level Makefile, whose fetch-3p target clones the checkouts.
 include pins.mk
 
 # Pin the 3p repos to the verified SHAs. No-op when already pinned. Refuses

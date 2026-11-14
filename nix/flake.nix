@@ -24,7 +24,7 @@
             gnutar
             xz
             qemu # qemu-system-x86_64, qemu-img, qemu-nbd
-            util-linux # flock, sfdisk
+            util-linux # flock, partx
             openssl # password hash for the offline preparation
             e2fsprogs # debugfs, e2fsck, dumpe2fs
             libnbd # nbdfuse, for the offline repair of a qcow2 image

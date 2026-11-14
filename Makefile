@@ -54,7 +54,7 @@ RM            := rm -f
 LOCK          := flock
 LOCK_FILE     := $(IMG_DIR)/.build.lock
 
-.PHONY: all download check base provision run run-nokvm ssh ssh-peon clean distclean toolchain toolchain-clean toolchain-docker verify-vm hurd-build 9pfs fetch-3p partitionfs-build
+.PHONY: all download check base provision run run-nokvm ssh ssh-peon clean distclean toolchain toolchain-clean toolchain-docker verify-vm hurd-build 9pfs fetch-3p
 
 all: base
 
@@ -81,9 +81,11 @@ base: $(BASE_IMG)
 
 # The image is built in a temporary file and moved into place, so that an
 # interrupted build never leaves a partially written base image behind.
-# The preparation script is a prerequisite, so that changing it rebuilds
-# the base image.
-$(BASE_IMG): $(EXTRACT_STAMP) scripts/prepare_base.sh $(PARTITIONFS)
+# The preparation scripts are prerequisites, so that changing them rebuilds
+# the base image. Every prerequisite is a real file: a phony prerequisite
+# would rebuild the base image, and discard its provisioning, on every
+# "make run" and "make provision".
+$(BASE_IMG): $(EXTRACT_STAMP) scripts/prepare_base.sh scripts/partition.sh
 	@$(MKDIR_P) $(IMG_DIR)
 	@$(LOCK) $(LOCK_FILE) sh -c 'set -e; \
 		ROOT_PASSWORD=$(ROOT_PASSWORD) bash scripts/prepare_base.sh $(RAW_IMG) $(WORK_IMG); \
@@ -92,7 +94,7 @@ $(BASE_IMG): $(EXTRACT_STAMP) scripts/prepare_base.sh $(PARTITIONFS)
 		rm -f $(WORK_IMG)'
 
 # Provision the base image in-VM (idempotent: skips if already provisioned)
-provision: $(BASE_IMG) $(PARTITIONFS)
+provision: $(BASE_IMG)
 	@$(MKDIR_P) $(IMG_DIR)
 	@$(LOCK) $(LOCK_FILE) env ROOT_PASSWORD=$(ROOT_PASSWORD) \
 		CPU_COUNT=$(CPU_COUNT) MEMORY=$(MEMORY) \
@@ -171,8 +173,6 @@ ssh-peon:
 # The URLs match the verified checkouts.
 3P_DIR   ?= 3p
 include toolchain/pins.mk
-PARTITIONFS_DIR := $(3P_DIR)/partitionfs
-PARTITIONFS     := $(PARTITIONFS_DIR)/build/partitionfs
 
 fetch-3p:
 	@set -e; \
@@ -199,52 +199,6 @@ fetch-3p:
 	else \
 		echo "fetch-3p: non-default 3P_DIR; pin the tree manually with 'make -C toolchain 3p-pin' after pointing 3p at it"; \
 	fi
-
-# Clone and pin only the partitionfs checkout: enough to build the base
-# image. The rest of the 3p tree is fetched by fetch-3p (toolchain targets).
-fetch-partitionfs:
-	@set -e; \
-	if [ -L $(3P_DIR) ] && [ ! -d $(3P_DIR) ]; then \
-		echo "fetch-partitionfs: $(3P_DIR) is a dangling symlink; point it at the 3p checkout"; \
-		exit 1; \
-	fi; \
-	if [ ! -e $(3P_DIR) ]; then mkdir $(3P_DIR); fi; \
-	if [ ! -d $(3P_DIR) ]; then echo "fetch-partitionfs: $(3P_DIR) exists and is not a directory"; exit 1; fi; \
-	if [ ! -d $(3P_DIR)/partitionfs/.git ]; then \
-		echo "fetch-partitionfs: cloning $(PARTITIONFS_URL) into $(3P_DIR)/partitionfs"; \
-		git clone $(PARTITIONFS_URL) $(3P_DIR)/partitionfs; \
-	fi; \
-	if ! git -C $(3P_DIR)/partitionfs cat-file -e $(PARTITIONFS_PIN)^{commit} 2>/dev/null; then \
-		echo "fetch-partitionfs: pinned commit $(PARTITIONFS_PIN) not present locally; fetching from origin"; \
-		git -C $(3P_DIR)/partitionfs fetch origin $(PARTITIONFS_PIN) || { \
-			echo "fetch-partitionfs: fetch failed for partitionfs; restore the pinned 3p checkout"; \
-			exit 1; \
-		}; \
-	fi; \
-	if ! git -C $(3P_DIR)/partitionfs diff --quiet || ! git -C $(3P_DIR)/partitionfs diff --cached --quiet; then \
-		echo "fetch-partitionfs: partitionfs has uncommitted changes; commit or stash them before pinning"; \
-		exit 1; \
-	fi; \
-	cur=$$(git -C $(3P_DIR)/partitionfs rev-parse HEAD); \
-	if [ "$$cur" = "$(PARTITIONFS_PIN)" ]; then \
-		echo "fetch-partitionfs: partitionfs already at pinned commit $(PARTITIONFS_PIN)"; \
-	else \
-		echo "fetch-partitionfs: partitionfs $$cur -> $(PARTITIONFS_PIN) (detached HEAD)"; \
-		git -C $(3P_DIR)/partitionfs checkout --detach $(PARTITIONFS_PIN); \
-	fi
-
-# Build the partitionfs FUSE filesystem from the pinned 3p checkout. The
-# image provisioning scripts expose the partitions of the disk image as
-# plain files through it (prepare_base.sh, repair_filesystem.sh); they
-# default to this binary. It is a host tool, not built with the Hurd
-# toolchain.
-partitionfs-build: fetch-partitionfs
-	@command -v cmake >/dev/null || { echo "partitionfs-build: cmake is required" >&2; exit 1; }
-	@pkg-config --exists fuse || { echo "partitionfs-build: FUSE development files not found (pkg-config fuse; install e.g. libfuse-dev)" >&2; exit 1; }
-	@pkg-config --exists libparted || { echo "partitionfs-build: libparted development files not found (pkg-config libparted; install e.g. libparted-dev)" >&2; exit 1; }
-	cmake -S $(PARTITIONFS_DIR) -B $(PARTITIONFS_DIR)/build -DCMAKE_BUILD_TYPE=Release
-	cmake --build $(PARTITIONFS_DIR)/build
-	@test -x $(PARTITIONFS) && echo "partitionfs-build: $(PARTITIONFS)"
 
 # --- cross toolchain (delegates to toolchain/Makefile) ---
 toolchain: fetch-3p    ; $(MAKE) -C toolchain toolchain
