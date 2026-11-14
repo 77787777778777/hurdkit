@@ -15,6 +15,8 @@ Use this skill whenever work touches the Hurd disk image or its boot path:
 
 - `Makefile` - pipeline definition and all tunables (version, URL, MD5, ports, password).
 - `scripts/prepare_base.sh` - offline changes applied to a copy of the raw image.
+- `scripts/partition.sh` - finds a partition inside a disk image by its byte offset
+  (sourced by the preparation and the repair script).
 - `scripts/provision_base.sh` - boots the guest and runs the provisioning.
 - `scripts/provision_guest.py` - drives the guest over SSH (login, commands, poweroff).
 - `scripts/repair_filesystem.sh` - offline ext2 repair of the provisioned image.
@@ -46,16 +48,19 @@ The acceptance criteria for a finished image are:
 
 - Tools available: `qemu-img` / `qemu-system-x86_64` 10.2.3, `wget`, `tar`, `xz`,
   `python3` 3.14 with the module `pexpect` 4.9, `ssh`, `md5sum`, `debugfs` 1.47.4,
-  `dumpe2fs`, `e2fsck`, `sfdisk`, `parted`, `fuse2fs`, `fusermount`, `openssl`,
+  `dumpe2fs`, `e2fsck`, `partx`, `parted`, `fuse2fs`, `fusermount`, `openssl`,
   `flock`, `qemu-nbd`, `nbdfuse`.
 - Tool **not** available: `sudo`, `nbd`, `guestfish`, `virt-customize`, `socat`,
   `sshpass`, `jq` (the repair script therefore parses the plain `qemu-img info`
   output instead of its JSON output). There is no root access, so loop mounts
-  and libguestfs are out; the offline write path is `partitionfs` + `debugfs`.
-- `partitionfs` (FUSE, exposes the partitions of a disk image as files) is
-  built from the pinned checkout in `3p/partitionfs` with `make partitionfs-build`
-  and lands at `3p/partitionfs/build/partitionfs`; the path is overridable
-  with the `PARTFS` environment variable.
+  and libguestfs are out; the offline write path is `debugfs` on the
+  partition inside the image.
+- A partition inside a disk image is addressed by its byte offset: e2fsprogs
+  opens the name `IMAGE?offset=BYTES` as a filesystem, so `debugfs`, `e2fsck`
+  and `dumpe2fs` work on the partition in place, through ordinary file I/O.
+  `scripts/partition.sh` reads the offset from the partition table with
+  `partx` (`partition_target IMAGE 2` prints the complete name). Nothing
+  is compiled on the host, and the offline preparation mounts nothing.
 - The Hurd sources are checked out next to the project in `hurd/`; read them
   (`hurd/ext2fs`, `hurd/libdiskfs`) when the behaviour of the translator matters.
 - KVM is available at `/dev/kvm`.
@@ -83,16 +88,13 @@ image out of date and re-extract it on every invocation.
 `prepare_base.sh <source.raw> <work.raw> [root_password]` never touches the
 downloaded image. It copies it to `img/hurd.work.img` and edits the copy:
 
-1. `cp --reflink=never` the raw image, then `sync "$WORK_IMG"`. Both details
-   are mandatory: `partitionfs` probes the image through the block layer,
-   which ignores the page cache, so an unflushed copy looks like it has no
-   partition table; and on filesystems with clone support (btrfs, XFS) a
-   default `cp` creates a reflink whose freshly cloned extents read back
-   inconsistently, which makes the `debugfs` dumps of this stage fail
-   nondeterministically (see pitfall 41).
-2. Mount the copy with `partitionfs` in a fresh `mktemp -d` directory; the root
-   filesystem is then the file `<mountdir>/2`.
-3. Apply the offline edits with `debugfs -w`:
+1. `cp --reflink=never` the raw image: a real copy, not a reflink (see
+   pitfall 41).
+2. Find the root filesystem inside the copy. `partition_target <work.raw> 2`
+   (from `scripts/partition.sh`) prints `<work.raw>?offset=1000341504`, the
+   name under which e2fsprogs opens partition 2. The script checks with
+   `debugfs -R stats` that an ext2 filesystem really starts at that offset.
+3. Apply the offline edits with `debugfs -w` on that name:
    - `/boot/grub/grub.cfg` - serial console and auto-boot (see below),
    - `/etc/default/grub` - the same settings, so `update-grub` keeps them,
    - `/etc/shadow` - password hash for `root`,
@@ -274,17 +276,20 @@ not a replacement.
 
 `repair_filesystem.sh <image> [partition]` repairs the root filesystem of a
 disk image **without converting the image to a raw file**. The image is served
-by `qemu-nbd`, `nbdfuse` exposes that server as a plain file, `partitionfs`
-exposes the partitions of that file, and `e2fsck` works directly on the
-partition file. Its writes travel back through the chain into the original
+by `qemu-nbd`, `nbdfuse` exposes that server as a plain file with the raw
+content of the disk, and `e2fsck` opens the partition inside that file by its
+byte offset. Its writes travel back through the chain into the original
 image:
 
 ```
 qemu-nbd -k <socket> -f <format> <image>      # serve the image
 nbdfuse <mnt>/disk.raw --unix <socket>        # expose it as a file
-partitionfs <mnt>/disk.raw <partdir>          # expose its partitions
-e2fsck -fy <partdir>/2                        # repair through the chain
+e2fsck -fy '<mnt>/disk.raw?offset=<bytes>'    # repair through the chain
 ```
+
+The offset comes from `partition_target <mnt>/disk.raw <partition>` in
+`scripts/partition.sh`. A raw image needs no chain: the script then runs
+`e2fsck` on `<image>?offset=<bytes>` directly.
 
 `nbdfuse` is the FUSE client of libnbd; it speaks the NBD protocol in
 userspace and needs neither the kernel NBD module nor root privileges. Only
@@ -325,18 +330,24 @@ Every one of these was hit while building this pipeline.
    (the `shadow` group). Note the `=` in `-v OFS=:`; `-v OFS:` is an awk usage
    error.
 
-4. **`partitionfs` sees no partitions after `cp`.** libparted reads the image
-   through the block layer and ignores the page cache. Fix: `sync "$WORK_IMG"`
-   after every copy of the image.
+4. **A tool that reads the image with direct I/O does not see an unflushed
+   copy.** The pipeline used to expose the partitions through the FUSE tool
+   `partitionfs`, whose libparted backend bypasses the page cache: right
+   after `cp` it found no partition table, so every copy had to be followed
+   by `sync "$WORK_IMG"`, which blocks for minutes when the disk is busy.
+   Fix: no direct I/O. `debugfs` and `e2fsck` open the partition by its
+   offset (`IMAGE?offset=BYTES`) through the page cache, and the copy needs
+   no `sync`.
 
 5. **`debugfs write` cannot overwrite an existing file.** The command fails
    with "Could not create file". Fix: `rm <file>` first, then `write`.
    The debugfs command file has no shell syntax and no `#` comments.
 
 6. **`fuse2fs` refuses to write root-owned files.** It enforces strict
-   ownership, and without root privileges nothing can be written. Fix: use
-   `partitionfs` (which exposes the partition as a plain file) plus
-   `debugfs -w` on that file.
+   ownership, and without root privileges nothing can be written. Fix:
+   `debugfs -w`, which edits the filesystem structures directly and does not
+   care who owns a file, on the partition inside the image
+   (`IMAGE?offset=BYTES`).
 
 7. **The driver matches the wrong branch.** `NOT_PROVISIONED` contains the
    substring `PROVISIONED`, and the guest echoes the command line, which
@@ -365,11 +376,12 @@ Every one of these was hit while building this pipeline.
     mtime of the image inside the tarball, so the raw image always looks older
     than the tarball. Fix: the `img/.extracted` stamp file.
 
-12. **Stale FUSE mounts block the next run.** `partitionfs` fails with
-    "mountpoint is not empty" when the mount directory still holds content, and
-    removing such a directory fails with "Function not implemented". Fix:
-    `fusermount -u` before cleanup, and use a fresh `mktemp -d` mount point per
-    run.
+12. **Stale FUSE mounts block the next run.** A FUSE tool refuses a mount
+    point that still holds content ("mountpoint is not empty"), and removing
+    a directory with a stale mount in it fails with "Function not
+    implemented". Fix: unmount before cleanup, and use a fresh `mktemp -d`
+    mount point per run. The offline preparation mounts nothing any more;
+    only the repair of a qcow2 image does (`nbdfuse`).
 
 13. **The guest has no virtio drivers.** With `if=virtio` the disk is never
     found. Fix: `if=ide` and `-device e1000` for the network.
@@ -400,9 +412,9 @@ Every one of these was hit while building this pipeline.
 20. **Converting the image to raw is the slow part of the repair.** A
     qcow2 -> raw conversion, a `dd` of the partition, the repair and the
     conversion back move more than 20 GB through the disk. Fix: serve the
-    image with `qemu-nbd`, expose it with `nbdfuse` and its partitions with
-    `partitionfs`, and let `e2fsck` write through the chain (7 seconds
-    instead of minutes). The image format has to be passed to `qemu-nbd`
+    image with `qemu-nbd`, expose it with `nbdfuse`, and let `e2fsck` open
+    the partition inside that file by its offset and write through the chain
+    (seconds instead of minutes). The image format has to be passed to `qemu-nbd`
     explicitly, and `nbdfuse` must be told which socket to use
     (`--unix <socket>`); `qemu-nbd` has no socket activation mode, so the
     socket is created with `-k <path>` and the server is stopped explicitly
@@ -583,12 +595,15 @@ Every one of these was hit while building this pipeline.
     clone support (btrfs, XFS), `cp` defaults to `--reflink=auto`: the 4 GB
     "copy" of the raw image takes a millisecond and shares its data extents
     with the source. Reading a freshly cloned image through `partitionfs`
-    then intermittently returns inconsistent data, and `debugfs` fails with
+    (the FUSE tool the pipeline used then, which reads with direct I/O)
+    intermittently returned inconsistent data, and `debugfs` failed with
     a bogus "Ext2 inode is not a directory" (three failures out of five in a
     retry test), which broke the preparation nondeterministically. The
     `sync` afterwards does not help: a reflink has no dirty data to flush.
     Fix: `cp --reflink=never`; a real copy costs a few seconds and is
-    reliable.
+    reliable. The partition is read through the page cache now, where the
+    problem is not expected, but that has not been tested again on btrfs or
+    XFS, so the real copy stays.
 
 42. **A failed `debugfs dump` fails silently.** `debugfs` exits 0 even when
     the dump fails, and its diagnostics go to stderr. The preparation
@@ -606,6 +621,26 @@ Every one of these was hit while building this pipeline.
     installed in the guest. Fix: `-o IdentitiesOnly=yes` next to `-i`, in
     the key login check of the provisioning and in `make ssh` /
     `make ssh-peon`.
+
+44. **A phony prerequisite rebuilds its target on every run.** The rule of
+    the base image listed the phony target `partitionfs-build` as a
+    prerequisite. make treats a phony prerequisite as always newer than the
+    target, so `make run` and `make provision` rebuilt the base image from
+    the downloaded image every time and silently threw the provisioning
+    away; a second `make provision` was never a no-op. Fix: the base image
+    depends on real files only (the extraction stamp and the scripts). The
+    check: with an up-to-date base image, `make -n run` must not print
+    `prepare_base.sh`.
+
+45. **A helper that needs libfuse 2 is a dead end.** `partitionfs` is
+    written against the FUSE 2 API, which distributions are removing
+    (nixpkgs has no libfuse 2 after 26.05), and it had to be compiled on the
+    host with CMake and the libparted headers. Fix: none of it is needed.
+    e2fsprogs opens a filesystem at an offset inside a file
+    (`debugfs -w 'IMAGE?offset=BYTES'`, the same for `e2fsck`, `dumpe2fs`
+    and `mke2fs -E offset=BYTES`), and `partx -s IMAGE` prints the partition
+    table of a regular file. Quote the name in the shell: it contains a
+    question mark.
 
 ## Known issue: ext2 without a journal
 
@@ -631,8 +666,8 @@ Facts established while investigating this:
 
 That is why `scripts/provision_base.sh` repairs the filesystem offline after the
 guest has powered off. The repair works on the image itself, through
-`qemu-nbd` -> `nbdfuse` -> `partitionfs`, so no conversion to a raw file is
-needed.
+`qemu-nbd` -> `nbdfuse`, with `e2fsck` opening the partition by its offset,
+so no conversion to a raw file is needed.
 
 ## How to update it
 
@@ -715,8 +750,8 @@ guest.
 ### Change the disk layout
 
 The root filesystem is partition 2. It is referenced in three places:
-`root=part:2:device:wd0` in the GRUB config of `scripts/prepare_base.sh`, the
-`PART_FILE="$WORK_DIR/2"` in the same script, and the partition number argument
+`root=part:2:device:wd0` in the GRUB config of `scripts/prepare_base.sh`,
+`ROOT_PARTITION=2` in the same script, and the partition number argument
 of `scripts/repair_filesystem.sh` (default 2).
 
 ### Rebuild from scratch
@@ -733,8 +768,7 @@ Check that the root filesystem of the base image is clean:
 
 ```
 qemu-img convert -f qcow2 -O raw img/hurd.base.qcow2 /tmp/base.raw
-dd if=/tmp/base.raw of=/tmp/base.p2.img bs=512 skip=1953792 count=6236160 status=none
-e2fsck -fn /tmp/base.p2.img      # expect exit status 0
+e2fsck -fn '/tmp/base.raw?offset=1000341504'      # expect exit status 0
 ```
 
 The same check through the NBD chain, without the conversion (a few seconds

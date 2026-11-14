@@ -2,10 +2,12 @@
 # Prepare the Hurd base image: copy the pristine raw disk image and apply
 # offline changes to the copy (the downloaded image stays untouched).
 #
-# The root filesystem lives on partition 2 (ext2). partitionfs exposes the
-# partitions of the disk image as regular files, and debugfs edits that file
-# in place. fuse2fs cannot be used for writing because it enforces strict
-# ownership, and root-owned files cannot be modified without root privileges.
+# The root filesystem lives on partition 2 (ext2). debugfs edits it in place
+# inside the disk image: e2fsprogs opens a filesystem that starts at a byte
+# offset in a file ("IMAGE?offset=BYTES", see scripts/partition.sh), so no
+# loop device, no FUSE mount and no root privileges are needed. fuse2fs
+# cannot be used for writing because it enforces strict ownership, and
+# root-owned files cannot be modified without root privileges.
 #
 # Changes applied offline (no VM boot required):
 #   * /boot/grub/grub.cfg              - serial console + auto-boot
@@ -20,24 +22,24 @@ set -euo pipefail
 SRC_IMG="${1:?Usage: $0 <source.raw> <work.raw> [root_password]}"
 WORK_IMG="${2:?Usage: $0 <source.raw> <work.raw> [root_password]}"
 ROOT_PASSWORD="${3:-abcdef}"
-# Default to the partitionfs built from the pinned 3p checkout
-# (make partitionfs-build); override with the PARTFS environment variable.
+# The root filesystem is this partition of the disk image.
+ROOT_PARTITION=2
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-PARTFS="${PARTFS:-$REPO_ROOT/3p/partitionfs/build/partitionfs}"
+# shellcheck source=scripts/partition.sh
+source "$SCRIPT_DIR/partition.sh"
 
 if [[ ! -f "$SRC_IMG" ]]; then
     echo "Source image not found: $SRC_IMG" >&2
     exit 1
 fi
 
-if [[ ! -x "$PARTFS" ]]; then
-    echo "partitionfs binary not found or not executable: $PARTFS" >&2
+if ! command -v debugfs >/dev/null 2>&1; then
+    echo "debugfs is required for offline image preparation" >&2
     exit 1
 fi
 
-if ! command -v debugfs >/dev/null 2>&1; then
-    echo "debugfs is required for offline image preparation" >&2
+if ! command -v partx >/dev/null 2>&1; then
+    echo "partx is required to read the partition table of the image" >&2
     exit 1
 fi
 
@@ -59,17 +61,7 @@ password_hash() {
 ROOT_HASH="$(password_hash)"
 
 TMP_DIR="$(mktemp -d)"
-# A dedicated mount point per run: a leftover FUSE mount from an earlier run
-# would make partitionfs fail with "mountpoint is not empty".
-WORK_DIR="$(mktemp -d "$(dirname "$WORK_IMG")/partitions.XXXXXX")"
-PARTFS_PID=""
 cleanup() {
-    fusermount -u "$WORK_DIR" 2>/dev/null || true
-    if [[ -n "$PARTFS_PID" ]]; then
-        kill "$PARTFS_PID" 2>/dev/null || true
-        wait "$PARTFS_PID" 2>/dev/null || true
-    fi
-    rmdir "$WORK_DIR" 2>/dev/null || true
     rm -rf "$TMP_DIR"
 }
 trap cleanup EXIT
@@ -100,36 +92,29 @@ SSHDCONF
 # Work on a copy: the downloaded image must stay pristine so that the
 # preparation can be repeated from a known state.
 #
-# --reflink=never is required on filesystems that support clone requests
-# (btrfs, XFS): cp defaults to --reflink=auto there, and reading a
-# reflinked image right after the clone intermittently returns inconsistent
-# data, which made debugfs fail with a bogus "Ext2 inode is not a directory"
-# and broke the dumps below nondeterministically. A real copy costs a few
-# seconds but is reliable.
+# --reflink=never makes cp write a real copy on filesystems that support
+# clone requests (btrfs, XFS), where it defaults to --reflink=auto. A
+# reflinked copy read back inconsistently when the partition was accessed
+# with direct I/O (the partitionfs tool that this script used before did
+# that) and made debugfs fail with a bogus "Ext2 inode is not a directory".
+# The image is now accessed through ordinary buffered I/O, which is not
+# known to have that problem, but a real copy is the tested configuration
+# and costs only a few seconds.
 cp --reflink=never "$SRC_IMG" "$WORK_IMG"
-# libparted probes the image through the block layer, which ignores the
-# page cache; without flushing the copy the partition table reads back empty
-# and partitionfs exposes no partitions.
-sync "$WORK_IMG"
 
-# Expose partitions as numbered files
-"$PARTFS" "$WORK_IMG" "$WORK_DIR" &
-PARTFS_PID=$!
-
-# Wait for partition file to appear
-for _ in $(seq 1 10); do
-    if [[ -f "$WORK_DIR/2" ]]; then
-        break
-    fi
-    sleep 1
-done
-
-if [[ ! -f "$WORK_DIR/2" ]]; then
-    echo "Partition 2 not found after partitionfs mount" >&2
+# The name under which debugfs opens the root partition inside the image:
+# "<work image>?offset=<byte offset of the partition>".
+if ! PART_FILE="$(partition_target "$WORK_IMG" "$ROOT_PARTITION")"; then
+    echo "The image $WORK_IMG has no partition $ROOT_PARTITION" >&2
     exit 1
 fi
 
-PART_FILE="$WORK_DIR/2"
+# The offset has to point at an ext2 filesystem; a wrong partition number or
+# a damaged partition table would otherwise surface as a failed dump below.
+if ! debugfs -R "stats" "$PART_FILE" >/dev/null 2>&1; then
+    echo "No ext2 filesystem found at $PART_FILE" >&2
+    exit 1
+fi
 
 # Dump a file out of the image. debugfs returns exit status 0 even when the
 # dump fails, and its diagnostics go to stderr, so a failed dump used to

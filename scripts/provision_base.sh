@@ -207,8 +207,8 @@ QEMU_PID=""
 # Repair the filesystem of the provisioned copy. The guest wrote to the
 # filesystem, and without a journal the shutdown leaves stale inode and
 # block bitmaps behind. The repair runs on the image itself: qemu-nbd
-# serves it, nbdfuse exposes it as a file and partitionfs exposes the
-# partition, so no conversion is needed.
+# serves it, nbdfuse exposes it as a file and e2fsck opens the partition
+# inside that file by its offset, so no conversion is needed.
 bash "$SCRIPT_DIR/repair_filesystem.sh" "$WORK_IMG"
 
 # Flatten the provisioned overlay into the new base image. The overlay
