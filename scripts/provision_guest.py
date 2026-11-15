@@ -13,9 +13,18 @@ The configuration comes from the environment:
                       forwarded to (default 127.0.0.1)
     SSH_PORT          the forwarded SSH port (default 2222)
     ROOT_PASSWORD     the password of the root account
+    STAGES            comma-separated stages to run (default
+                      "accounts,packages", the full base provisioning);
+                      see STAGE_DESCRIPTIONS below
     RUN_APT_UPGRADE   "1" runs "apt-get update" and "apt-get upgrade"
-    GUEST_PACKAGES    the packages that the guest gets (default
-                      "curl python3 gdb")
+                      (packages stage only)
+    GUEST_PACKAGES    the packages that the guest gets (packages stage;
+                      default "curl python3 gdb")
+    CUSTOM_KERNEL     path to a host-side gnumach ELF binary to ship in
+                      the overlay as the boot kernel of the guest
+                      (kernel stage; optional)
+    CUSTOM_OVERLAY    host directory whose contents are copied into the
+                      guest filesystem (kernel stage; optional)
     SSH_KEY_DIR       the directory with the SSH keys of the accounts
                       (default "img/keys")
 
@@ -27,10 +36,14 @@ Exit codes:
         cannot help
 """
 
+import gzip
+import io
 import os
 import re
 import subprocess
 import sys
+import tarfile
+import tempfile
 
 try:
     import pexpect
@@ -58,6 +71,26 @@ NEW_ACCOUNT_HOME = "/home/peon"
 # can be logged into without a password.
 KEY_ACCOUNTS = (("root", "/root"), (NEW_ACCOUNT, NEW_ACCOUNT_HOME))
 
+# The kernel that the GRUB entry of the image boots; CUSTOM_KERNEL ships
+# its replacement inside the overlay tar (see pack_overlay).
+STOCK_KERNEL = "/boot/gnumach-1.8-amd64-up.gz"
+
+# The provisioning stages, each idempotent on its own, in the order in
+# which they are meant to be applied to a chain of images:
+#
+#   accounts: rename the account of the image, set the passwords,
+#             install the SSH keys ("image with sshd/account changes")
+#   packages: prune the apt sources, install GUEST_PACKAGES, optionally
+#             upgrade ("image with apt packages")
+#   kernel:   copy the CUSTOM_OVERLAY directory and/or the CUSTOM_KERNEL
+#             boot kernel into the guest filesystem ("image with custom
+#             kernel, custom drivers, init scripts etc")
+#
+# A stage is applied to a copy of the image that carries the stages
+# before it (scripts/provision_stage.sh chains them).  Every stage
+# re-runs safely on an image that already has it.
+STAGE_DESCRIPTIONS = "accounts, packages, kernel"
+
 PROMPT = re.compile(r"# $")
 PASSWORD_PROMPT = re.compile(r"(?i)password:")
 EXIT_STATUS = re.compile(r"__RC__(-?[0-9]+)__")
@@ -80,6 +113,9 @@ class GuestSession:
     """An SSH session with the guest, driven through pexpect."""
 
     def __init__(self, host, port, password):
+        self.host = host
+        self.port = port
+        self.password = password
         self.child = pexpect.spawn(
             "ssh",
             [
@@ -168,6 +204,47 @@ class GuestSession:
         if index == 2:
             raise GuestError(f"Timeout waiting for the prompt after: {command}", 1)
         return status
+
+    def copy_to_guest(self, host_path, guest_path):
+        """Copy a host file into the guest with scp.
+
+        scp uses the legacy protocol (-O): the guest has the scp binary
+        (openssh-server depends on openssh-client), while the sftp server
+        is one more moving part than the copy needs.  The authentication
+        mirrors the login: password only, host key not checked.
+        """
+        child = pexpect.spawn(
+            "scp",
+            [
+                "-O",
+                "-o", "StrictHostKeyChecking=no",
+                "-o", "UserKnownHostsFile=/dev/null",
+                "-o", "PreferredAuthentications=password",
+                "-o", "PubkeyAuthentication=no",
+                "-P", str(self.port),
+                host_path,
+                f"root@{self.host}:{guest_path}",
+            ],
+            encoding="utf-8",
+            timeout=KEY_LOGIN_TIMEOUT,
+        )
+        index = child.expect(
+            [PASSWORD_PROMPT, pexpect.EOF, pexpect.TIMEOUT],
+            timeout=KEY_LOGIN_TIMEOUT,
+        )
+        if index == 1:
+            raise GuestError("scp closed the connection before the password prompt", 1)
+        if index == 2:
+            raise GuestError("Timeout starting scp", 1)
+        child.send(self.password + "\r")
+        # The copy of a multi-megabyte kernel takes longer than the login.
+        index = child.expect(
+            [pexpect.EOF, PASSWORD_PROMPT, pexpect.TIMEOUT], timeout=COMMAND_TIMEOUT
+        )
+        if index == 1:
+            raise GuestError("scp was rejected, the password is wrong", 1)
+        if index == 2:
+            raise GuestError("Timeout copying the file into the guest", 1)
 
     def poweroff(self, timeout=60, attempts=2):
         """Ask the guest to power off.
@@ -565,23 +642,106 @@ def upgrade_packages(session):
     session.run_command("apt-get clean", "apt_clean")
 
 
-def provision(session, run_apt_upgrade, packages, key_dir, password):
-    disable_unreleased_suite(session)
+def pack_overlay(overlay_dir, kernel_binary):
+    """Pack the overlay tarball on the host.
 
-    # The packages are installed on every run, not only on the first one:
-    # a package that is added to the list has to reach the images that
-    # were provisioned before it was added.
-    install_packages(session, packages)
+    The tar carries the CUSTOM_OVERLAY tree (extracted over / in the
+    guest) and, when CUSTOM_KERNEL names a kernel binary, that binary
+    gzipped at the boot path.  Packing the kernel into the same tar
+    keeps a single apply path on the guest side: the whole kernel stage
+    is one overlay, whatever it carries.  Shipping the boot kernel in
+    both ways at once is ambiguous and rejected.
 
-    # The account and the keys are set up on every run as well, so that
-    # they also reach the images that were provisioned before.
+    Returns (tarball path, whether the tar carries a boot kernel); the
+    caller removes the tarball.
+    """
+    fd, tarball = tempfile.mkstemp(suffix=".tgz")
+    os.close(fd)
+
+    def root_owned(info):
+        info.uid = info.gid = 0
+        info.uname = info.gname = "root"
+        return info
+
+    boot_kernel = STOCK_KERNEL.lstrip("/")
+    ships_kernel = False
+    with tarfile.open(tarball, "w:gz") as tar:
+        if overlay_dir:
+            if kernel_binary and os.path.exists(os.path.join(overlay_dir, boot_kernel)):
+                raise GuestError(
+                    f"The overlay already ships {boot_kernel}; drop "
+                    "CUSTOM_KERNEL or the file from the overlay"
+                )
+            ships_kernel = os.path.exists(os.path.join(overlay_dir, boot_kernel))
+            tar.add(overlay_dir, arcname=".", filter=root_owned)
+        if kernel_binary:
+            # Compressed where it is built: GRUB decompresses gzip
+            # transparently, and the tar transport preserves the bytes.
+            with open(kernel_binary, "rb") as kernel:
+                data = kernel.read()
+            gz = gzip.compress(data, compresslevel=9)
+            info = tarfile.TarInfo(boot_kernel)
+            info.size = len(gz)
+            info.mode = 0o644
+            info.mtime = int(os.stat(kernel_binary).st_mtime)
+            info.uid = info.gid = 0
+            info.uname = info.gname = "root"
+            tar.addfile(info, io.BytesIO(gz))
+            ships_kernel = True
+    return tarball, ships_kernel
+
+
+def apply_overlay(session, overlay_dir, kernel_binary):
+    """Copy the overlay into the guest filesystem.
+
+    The overlay is packed on the host (pack_overlay) and extracted over
+    / in the guest, so modes and symlinks survive and files land at
+    exactly the paths they have relative to the overlay directory.
+    Every entry is rewritten to be owned by root: the tar would
+    otherwise carry the uid and gid of the host account that built it,
+    and the guest services expect their files root-owned.  A boot
+    kernel in the overlay is checked with gzip -t after the extraction,
+    so a corrupt one fails the stage instead of the next boot.
+    """
+    print("Applying the overlay...", flush=True)
+    tarball, ships_kernel = pack_overlay(overlay_dir, kernel_binary)
+    check = f" && gzip -t {STOCK_KERNEL}" if ships_kernel else ""
+    try:
+        session.copy_to_guest(tarball, "/tmp/overlay.tgz")
+        status = session.run_command(
+            f"tar -xzf /tmp/overlay.tgz -C /{check} && rm -f /tmp/overlay.tgz",
+            "overlay_apply",
+        )
+    finally:
+        os.remove(tarball)
+    if status != 0:
+        raise GuestError(
+            "Applying the overlay failed "
+            "(see /tmp/provision_overlay_apply.log in the guest)"
+        )
+
+
+def stage_accounts(session, password, key_dir):
+    """Stage "accounts": rename the account of the image, set its
+    password and install the SSH keys.  The account and the keys are set
+    up on every run, so that they also reach the images that were
+    provisioned before."""
     rename_account(session, OLD_ACCOUNT, NEW_ACCOUNT)
     set_account_password(session, NEW_ACCOUNT, password)
-    key_pairs = install_authorized_keys(session, key_dir)
+    return install_authorized_keys(session, key_dir)
+
+
+def stage_packages(session, run_apt_upgrade, packages):
+    """Stage "packages": prune the apt sources, install GUEST_PACKAGES
+    and optionally upgrade.  The installation runs on every invocation
+    (a package added to the list reaches images provisioned before it
+    was added); the marker only gates the upgrade."""
+    disable_unreleased_suite(session)
+    install_packages(session, packages)
 
     if session.run_command("test -f /root/.provisioned", "marker") == 0:
         print("Image is already provisioned.", flush=True)
-        return key_pairs
+        return
 
     if run_apt_upgrade:
         # Keep hurd-dev at the version that is installed. The hurd-dev
@@ -597,7 +757,14 @@ def provision(session, run_apt_upgrade, packages, key_dir, password):
 
     # Write the provision marker
     session.run_command("touch /root/.provisioned", "marker_write")
-    return key_pairs
+
+
+def stage_kernel(session, custom_kernel, custom_overlay):
+    """Stage "kernel": copy the CUSTOM_OVERLAY directory and/or the
+    CUSTOM_KERNEL boot kernel into the guest filesystem."""
+    if not custom_kernel and not custom_overlay:
+        raise GuestError("The kernel stage needs CUSTOM_KERNEL or CUSTOM_OVERLAY")
+    apply_overlay(session, custom_overlay, custom_kernel)
 
 
 def main():
@@ -606,11 +773,32 @@ def main():
     password = os.environ.get("ROOT_PASSWORD", "")
     run_apt_upgrade = os.environ.get("RUN_APT_UPGRADE", "0") == "1"
     packages = os.environ.get("GUEST_PACKAGES", "curl python3 gdb").split()
+    custom_kernel = os.environ.get("CUSTOM_KERNEL", "")
+    custom_overlay = os.environ.get("CUSTOM_OVERLAY", "")
     key_dir = os.environ.get("SSH_KEY_DIR", "img/keys")
+    stages = [s.strip() for s in os.environ.get("STAGES", "accounts,packages").split(",")
+              if s.strip()]
+
+    known_stages = {"accounts", "packages", "kernel"}
+    unknown = [s for s in stages if s not in known_stages]
+    if unknown:
+        print(f"Unknown stage(s) {', '.join(unknown)}; "
+              f"known stages: {STAGE_DESCRIPTIONS}", file=sys.stderr, flush=True)
+        return 2
+    if custom_overlay and not os.path.isdir(custom_overlay):
+        print(f"The overlay is not a directory: {custom_overlay}",
+              file=sys.stderr, flush=True)
+        return 2
 
     try:
         session = GuestSession(host, port, password)
-        key_pairs = provision(session, run_apt_upgrade, packages, key_dir, password)
+        key_pairs = []
+        if "accounts" in stages:
+            key_pairs = stage_accounts(session, password, key_dir)
+        if "packages" in stages:
+            stage_packages(session, run_apt_upgrade, packages)
+        if "kernel" in stages:
+            stage_kernel(session, custom_kernel, custom_overlay)
         for account, private_key in key_pairs:
             print(f"Checking the SSH key of {account}...", flush=True)
             verify_key_login(host, port, account, private_key)

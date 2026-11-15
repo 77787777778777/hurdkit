@@ -32,13 +32,27 @@
 #             defaults to its own line.  Pass VIRTIO_ADDR= (empty) to
 #             reproduce the shared-line wedge.
 #   QTRACE    QEMU trace pattern (e.g. "ioapic_*") logged to
-#             img/tmp/qtrace.log for IRQ-delivery forensics
+#             img/tmp/qtrace.log for IRQ-delivery forensics.  Only
+#             meaningful with kernel_irqchip=split (QEMU_EXTRA below);
+#             with the default in-kernel irqchip the guest IOAPIC is
+#             emulated by KVM and QEMU sees none of its traffic.
+#   QEMU_EXTRA
+#             Extra command-line arguments passed to boot_qemu's QEMU
+#             invocation (e.g. -machine kernel_irqchip=split).
+#   SSH_PROBE_ATTEMPTS
+#             Boot patience: number of 2-5 s SSH probes before the boot
+#             is declared timed out (default 120; split-irqchip boots
+#             need several hundred).
+#   BASE_IMG  Base image for the overlay (default img/hurd.base.qcow2).
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-BASE_IMG="${REPO_ROOT}/img/hurd.base.qcow2"
+# The base image is overridable so that a variant (e.g. one carrying a
+# custom kernel, see CUSTOM_KERNEL in scripts/provision_base.sh) can be
+# tested without touching the stock base.
+BASE_IMG="${BASE_IMG:-${REPO_ROOT}/img/hurd.base.qcow2}"
 SHARE="${SHARE:-${REPO_ROOT}/img/share}"
 MOUNT_TAG="${MOUNT_TAG:-hostshare}"
 SSH_PORT="${SSH_PORT:-2222}"
@@ -137,6 +151,7 @@ boot_qemu() {
         -device e1000,netdev=net0${E1000_ADDR:+,addr="$E1000_ADDR"} \
         -trace enable='v9fs_*' \
         ${QTRACE:+-trace enable="$QTRACE" -D "$TMP_DIR/qtrace.log"} \
+        ${QEMU_EXTRA:+$QEMU_EXTRA} \
         -monitor unix:"$MONITOR_SOCK",server,nowait \
         "$@" \
         -nographic > "$QEMU_LOG" 2>&1 &
@@ -159,7 +174,7 @@ boot_qemu() {
     # Probe with a real SSH login: QEMU binds the hostfwd port long before
     # the guest's sshd answers, so a TCP connect alone reports success
     # while the login would still race and die on a reset.
-    for _ in $(seq 1 120); do
+    for _ in $(seq 1 "${SSH_PROBE_ATTEMPTS:-120}"); do
         if ssh -i "$SSH_KEY" -p "$SSH_PORT" -o StrictHostKeyChecking=no \
             -o UserKnownHostsFile=/dev/null -o BatchMode=yes \
             -o LogLevel=ERROR -o ConnectTimeout=3 \

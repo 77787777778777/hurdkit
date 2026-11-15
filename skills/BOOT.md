@@ -19,6 +19,8 @@ Use this skill whenever work touches the Hurd disk image or its boot path:
   (sourced by the preparation and the repair script).
 - `scripts/provision_base.sh` - boots the guest and runs the provisioning.
 - `scripts/provision_guest.py` - drives the guest over SSH (login, commands, poweroff).
+- `scripts/provision_stage.sh` - applies one provisioning stage to an image
+  and writes a new image layered on top of it (staged variants).
 - `scripts/repair_filesystem.sh` - offline ext2 repair of the provisioned image.
 - `img/keys/` - the SSH keys of the guest accounts (private keys, not in git).
 - `img/debian-hurd-amd64-<VERSION>.img.tar.xz` - the downloaded Debian GNU/Hurd image
@@ -234,6 +236,112 @@ from `img/tmp/` looks for `img/tmp/img/hurd.base.qcow2`.
 
 The base image is only ever used as a read-only backing file, so it stays
 pristine; all writes land in the overlay in `img/tmp/`.
+
+### Staged image variants (`make stage`, `scripts/provision_stage.sh`)
+
+Provisioning stages can be applied one at a time, each producing its own
+image layered on top of the previous one:
+
+```
+raw -> prepared base -> accounts -> packages -> kernel -> (drivers) -> ...
+```
+
+`provision_stage.sh <stage> <in.qcow2> <out.qcow2> [ssh_port]` boots the
+input image in a throwaway overlay (the same skeleton as
+`provision_base.sh`: KVM detection, port-open wait, bounded poweroff wait,
+bounded SSH login retries), runs `provision_guest.py` with `STAGES=<stage>`,
+repairs the filesystem offline and promotes the overlay to the output image.
+A failed or interrupted stage never touches the input image: only a
+successful run replaces the output, through renaming the finished overlay
+into place.
+
+The output is not flattened: it stays a thin qcow2 image that holds only the
+writes of its stage and names the input image as backing file, so a stage
+costs its own changes, not a copy of the whole disk. The price is that a
+backing chain references its backing files by path: rebuild an upstream stage
+and the images layered on it are stale. The chain targets below rebuild the
+downstream stages for that reason; a variant that is only ever handed out on
+its own must be flattened first (`qemu-img convert`). The input and the output
+of a stage must differ.
+
+The stages and their environment (full list in `scripts/provision_guest.py`):
+
+- `accounts` - rename the account of the image, set passwords, install the
+  SSH keys. The keys live in `SSH_KEY_DIR` (default: `keys/` next to the
+  output image) and are shared across images.
+- `packages` - prune the apt sources, install `GUEST_PACKAGES`, optionally
+  upgrade (`RUN_APT_UPGRADE=1`; the marker gates the upgrade only).
+- `kernel` - copy an overlay into the guest filesystem: the
+  `CUSTOM_OVERLAY` directory (out-of-tree drivers, init scripts and
+  similar extra content) and, when `CUSTOM_KERNEL` names a kernel
+  binary, that kernel gzipped at the boot path
+  `/boot/gnumach-1.8-amd64-up.gz`. Needs at least one of the two. The
+  overlay is applied to an image created after the packages stage, never
+  into the base image: the packages image keeps the stock kernel, so a
+  broken variant is discarded and rebuilt from the chain rather than
+  repaired in place.
+
+The Makefile wraps this in the `stage` target (serialized with the same
+image lock as the other image steps):
+
+```
+make stage STAGE=kernel VARIANT=img/hurd.kernel.qcow2 \
+    CUSTOM_KERNEL=$HOME/work/x86_64-gnu-build/gnumach/gnumach
+```
+
+`STAGE_INPUT` (default: `img/hurd.base.qcow2`) names the image the stage is
+applied to, `VARIANT` (default: `img/hurd.kernel.qcow2`) the image that is
+produced. A stage also re-runs safely on an image that already carries it,
+which makes variant rebuilds reproducible: rebuild the chain from the base
+when a stage changes, or re-apply only the later stages when an early stage
+changes.
+
+Each image is thin, so `ls -la img/` shows what each stage actually wrote:
+the accounts image holds the account changes, the packages image the
+package installation, the kernel image the kernel stage: the base and the
+earlier stages are read through the backing chain, not copied.
+
+The standard chain is also encoded as real make targets, so make rebuilds
+only the stages whose input or scripts changed:
+
+```
+img/hurd.base.qcow2 -> img/hurd.accounts.qcow2 -> img/hurd.packages.qcow2
+                    -> img/hurd.kernel.qcow2   (kernel stage)
+```
+
+Building `img/hurd.kernel.qcow2` (or running `make stage` with its default
+`VARIANT`) walks that chain. The accounts and packages images are pipeline
+intermediates and are kept; a kernel variant is always rebuilt on top of the
+packages image, never into the base.
+
+The overlay is packed with tar on the host and extracted over `/` in the
+guest, so the files land at exactly the paths they have relative to the
+overlay directory and keep their modes and symlinks; ownership is
+rewritten to root, since the tar would otherwise carry the host
+account's uid and gid. `CUSTOM_KERNEL` travels in the same tar, gzipped
+at the boot path, and is checked with `gzip -t` after the extraction, so
+a corrupt kernel fails the stage instead of the next boot. The overlay
+directory may not itself carry `boot/gnumach-1.8-amd64-up.gz` when
+`CUSTOM_KERNEL` is set. Example layout that drops a translator, an init
+script and a canary for the smoke check into the image:
+
+```
+img/overlay/
+├── hurd/virtio-9p          (executable translator binary)
+├── etc/init.d/virtio-9p    (mode 755)
+└── root/overlay-marker     (shows up as /root/overlay-marker)
+```
+
+```
+make stage STAGE=kernel VARIANT=img/hurd.kernel.qcow2 \
+    CUSTOM_KERNEL=.../gnumach CUSTOM_OVERLAY=img/overlay
+```
+
+As a make prerequisite of the chain rule, `$(CUSTOM_OVERLAY)` is tracked
+through the directory mtime: entries added to or removed directly from
+the overlay directory trigger a rebuild, an edit deep inside does not
+(re-run through the prerequisite-free `stage` target or touch the
+directory).
 
 ## SSH keys
 

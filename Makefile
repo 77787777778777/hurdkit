@@ -23,8 +23,11 @@ BASE_IMG      := $(IMG_DIR)/hurd.base.qcow2
 TMP_DIR       := $(IMG_DIR)/tmp
 MEMORY        := 2G
 CPU_COUNT     := 4
-SSH_PORT      := 2222
-SSH_HOST      := 127.0.0.1
+# ?= so the port can come from the environment or the command line
+# (SSH_PORT=2223 make run): everything below (run, run-nokvm, ssh,
+# ssh-peon, the provisioning stages) already uses this one variable.
+SSH_PORT      ?= 2222
+SSH_HOST      ?= 127.0.0.1
 REUSE         ?= 0
 ROOT_PASSWORD := abcdef
 # The in-VM package upgrade is off by default: the sid archive ships a
@@ -34,6 +37,17 @@ RUN_APT_UPGRADE := 0
 # The packages that the guest gets during the provisioning. The list can be
 # changed, and the provisioning installs the packages that are missing.
 GUEST_PACKAGES := curl python3 gdb
+# Staged image builds (make stage): VARIANT is the image that is produced,
+# STAGE the stage that is applied on top of STAGE_INPUT, CUSTOM_KERNEL the
+# host-built kernel binary that the kernel stage ships in the overlay.
+STAGE_INPUT   ?= $(BASE_IMG)
+VARIANT       ?= $(IMG_DIR)/hurd.kernel.qcow2
+STAGE         ?= kernel
+CUSTOM_KERNEL ?=
+# A host directory copied into the guest filesystem by the kernel stage,
+# for out-of-tree drivers, init scripts etc.  CUSTOM_KERNEL travels in
+# the same overlay.
+CUSTOM_OVERLAY ?=
 # The SSH keys of the guest accounts. The private keys stay in this
 # directory and are used to log into the guest without a password.
 SSH_KEY_DIR   := $(IMG_DIR)/keys
@@ -54,7 +68,7 @@ RM            := rm -f
 LOCK          := flock
 LOCK_FILE     := $(IMG_DIR)/.build.lock
 
-.PHONY: all download check base provision run run-nokvm ssh ssh-peon clean distclean toolchain toolchain-clean toolchain-docker verify-vm hurd-build 9pfs fetch-3p
+.PHONY: all download check base provision stage run run-nokvm ssh ssh-peon clean distclean toolchain toolchain-clean toolchain-docker verify-vm hurd-build 9pfs fetch-3p
 
 all: base
 
@@ -102,6 +116,61 @@ provision: $(BASE_IMG)
 		GUEST_PACKAGES="$(GUEST_PACKAGES)" \
 		SSH_KEY_DIR="$(abspath $(SSH_KEY_DIR))" \
 		bash scripts/provision_base.sh $(BASE_IMG) $(SSH_PORT)
+
+# Apply one provisioning stage to an image and write a new image layered on
+# top of it: accounts -> packages -> kernel -> ... Each stage boots the input
+# image in a throwaway overlay and promotes that overlay (with its writes) to
+# VARIANT, a thin CoW image backed by the input, so a failed stage never
+# touches the input. The kernel stage needs CUSTOM_KERNEL (for example the
+# gnumach built under ~/work/x86_64-gnu-build/gnumach) or CUSTOM_OVERLAY.
+#
+#   make stage STAGE=kernel VARIANT=img/hurd.kernel.qcow2 \
+#       CUSTOM_KERNEL=~/work/x86_64-gnu-build/gnumach/gnumach
+#
+# The input image is not a make prerequisite: chaining means the input of a
+# stage is the output of the previous one (see the chain rules below), and a
+# one-off input does not have a rule. The stage script checks that it exists.
+stage:
+	@$(MKDIR_P) $(IMG_DIR)
+	@$(LOCK) $(LOCK_FILE) env ROOT_PASSWORD=$(ROOT_PASSWORD) \
+		CPU_COUNT=$(CPU_COUNT) MEMORY=$(MEMORY) \
+		RUN_APT_UPGRADE=$(RUN_APT_UPGRADE) \
+		GUEST_PACKAGES="$(GUEST_PACKAGES)" \
+		CUSTOM_KERNEL="$(CUSTOM_KERNEL)" \
+		CUSTOM_OVERLAY="$(CUSTOM_OVERLAY)" \
+		SSH_KEY_DIR="$(abspath $(SSH_KEY_DIR))" \
+		bash scripts/provision_stage.sh $(STAGE) $(abspath $(STAGE_INPUT)) $(abspath $(VARIANT)) $(SSH_PORT)
+
+# The staged chain as real make targets: each stage image is built from the
+# output of the previous stage, so rebuilding the variant rebuilds only the
+# stages whose input or script changed. The accounts and packages images are
+# the pipeline's intermediates; kernel variants are always built on top of
+# the packages image, never into the base. An image backs its predecessor by
+# path: if that predecessor is rebuilt, rebuild the dependent image too (make
+# does, through these rules).
+STAGE_ENV = ROOT_PASSWORD=$(ROOT_PASSWORD) \
+		CPU_COUNT=$(CPU_COUNT) MEMORY=$(MEMORY) \
+		RUN_APT_UPGRADE=$(RUN_APT_UPGRADE) \
+		GUEST_PACKAGES="$(GUEST_PACKAGES)" \
+		SSH_KEY_DIR="$(abspath $(SSH_KEY_DIR))"
+
+$(IMG_DIR)/hurd.accounts.qcow2: $(BASE_IMG) scripts/provision_stage.sh scripts/provision_guest.py
+	@$(LOCK) $(LOCK_FILE) env $(STAGE_ENV) \
+		bash scripts/provision_stage.sh accounts $(abspath $<) $(abspath $@) $(SSH_PORT)
+
+$(IMG_DIR)/hurd.packages.qcow2: $(IMG_DIR)/hurd.accounts.qcow2 scripts/provision_stage.sh scripts/provision_guest.py
+	@$(LOCK) $(LOCK_FILE) env $(STAGE_ENV) \
+		bash scripts/provision_stage.sh packages $(abspath $<) $(abspath $@) $(SSH_PORT)
+
+# $(CUSTOM_OVERLAY) is a directory prerequisite: make sees its mtime, which
+# changes when entries are added or removed directly in it; an edit deep
+# inside does not, and needs a re-run through the prerequisite-free stage
+# target (or a touch of the directory).
+$(IMG_DIR)/hurd.kernel.qcow2: $(IMG_DIR)/hurd.packages.qcow2 scripts/provision_stage.sh scripts/provision_guest.py $(CUSTOM_KERNEL) $(CUSTOM_OVERLAY)
+	@$(LOCK) $(LOCK_FILE) env $(STAGE_ENV) \
+		CUSTOM_KERNEL="$(CUSTOM_KERNEL)" \
+		CUSTOM_OVERLAY="$(CUSTOM_OVERLAY)" \
+		bash scripts/provision_stage.sh kernel $(abspath $<) $(abspath $@) $(SSH_PORT)
 
 # Boot from a temporary overlay so the base image stays pristine
 run: $(BASE_IMG)

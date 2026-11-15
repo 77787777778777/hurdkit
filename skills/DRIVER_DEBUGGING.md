@@ -90,7 +90,14 @@ order:
 4. QEMU IRQ tracing for the mask/unmask story:
    `QTRACE='ioapic_*' make virtio-irq-stress` logs every device assert
    (`ioapic_set_irq`) and every guest mask/unmask write
-   (`ioapic_mem_write`) to img/tmp/qtrace.log.
+   (`ioapic_mem_write`) to img/tmp/qtrace.log. **Requires
+   `QEMU_EXTRA='-machine kernel_irqchip=split'`**: with the default
+   in-kernel irqchip the guest IOAPIC belongs to KVM and the trace log
+   stays 0 bytes. Split also slows IRQ delivery: boots may need
+   `SSH_PROBE_ATTEMPTS=400`, and one split boot showed a self-healing
+   wd0 lost-interrupt (IDE serves its IRQ through the same irqhelp
+   path) — treat isolated soft-corrected ATA timeouts as latency
+   artifacts, not media failure.
 5. Reading files out of the qcow2: qemu-nbd + nbdfuse + debugfs with the
    `file?offset=<partition-2-byte-offset>` syntax (offset 1000341504 for
    this image). The daemons must be backgrounded with polling loops (the
@@ -109,10 +116,16 @@ starve, arbitrary victim point — first exchange or teardown). The QEMU
 threads stay healthy and the vCPUs idle; the guest freezes blocked. Not a
 driver bug: putting virtio-9p on its own line (slot ≡ 1 mod 4 → PIRQ A →
 IRQ 10, harness default `VIRTIO_ADDR=0x5`) makes it disappear 4/4, and
-`VIRTIO_ADDR=` reproduces it. Suspects live in gnumach's shared-line
-ack/unmask accounting (`device/intr.c`) and possibly the ioapic edge
-programming; a host-side ioapic trace of a wedged run is the next
-evidence to collect.
+`VIRTIO_ADDR=` reproduces it. Kernel-side mechanism identified
+2026-11-15: gnumach's nested `nested_irqs[].ndisabled` counters
+(`i386/i386/irq.c:43-92`) keep a shared pin masked until **every**
+alive entry on the line acks, so one lost/unacked notification (wedged
+driver thread, `deliver_intr` `ikm_alloc` failure) starves the whole
+line with no recovery sweep for alive entries; the ioapic RMW itself is
+lock-protected (`ioapic_lock`), and this QEMU's IOAPIC v0x20 uses the
+specific-EOI path (no mask+edge workaround). An `ioapic_*` qtrace of a
+wedged run (split irqchip) showing the last `ioapic_set_irq` followed
+by mask=1 and no unmask write is the confirmation to capture.
 
 ## Landmines learned the hard way
 
