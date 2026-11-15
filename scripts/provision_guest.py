@@ -579,6 +579,18 @@ def provision(session, run_apt_upgrade, packages, key_dir, password):
     set_account_password(session, NEW_ACCOUNT, password)
     key_pairs = install_authorized_keys(session, key_dir)
 
+    # Record what this provisioning installed. The host-side no-op check
+    # compares this manifest with GUEST_PACKAGES, so adding a package later
+    # still boots an already provisioned image. Images provisioned before
+    # this file existed retain the default package list in the host check.
+    package_manifest = " ".join(packages)
+    status = session.run_command(
+        f"printf '%s\\n' '{package_manifest}' > /root/.provision-packages",
+        "package_manifest",
+    )
+    if status != 0:
+        raise GuestError("Could not write the package manifest in the guest")
+
     if session.run_command("test -f /root/.provisioned", "marker") == 0:
         print("Image is already provisioned.", flush=True)
         return key_pairs
@@ -595,7 +607,6 @@ def provision(session, run_apt_upgrade, packages, key_dir, password):
     else:
         print("Skipping apt update and apt upgrade (RUN_APT_UPGRADE is not set).", flush=True)
 
-    # Write the provision marker
     session.run_command("touch /root/.provisioned", "marker_write")
     return key_pairs
 
