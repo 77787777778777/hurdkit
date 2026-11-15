@@ -16,8 +16,12 @@ Configuration comes from the environment:
     P9FS_BIN          host path of the unmodified 9pfs translator
     SHARE             host path of the shared directory
     QEMU_LOG          path of the QEMU serial log (dumped on failure)
-    GDB               "1" installs gdb in the guest and attaches it to the
-                      stuck processes when the matrix fails
+    GDB               "1" installs gdb in the Debian guest and attaches it to
+                      the stuck processes when the matrix fails
+    VIRTIO_GDB_COMMAND override the debugger command for another guest (the
+                      Guix harness supplies its own, with no apt fallback)
+    VIRTIO_HALT_COMMAND override poweroff (Guix uses halt)
+    VIRTIO_POWEROFF_TIMEOUT seconds to wait for the connection to close
 
 Modes (argv[1]):
 
@@ -53,6 +57,9 @@ SHARE = os.environ["SHARE"]
 MOUNT_TAG = os.environ.get("MOUNT_TAG", "hostshare")
 QEMU_LOG = os.environ.get("QEMU_LOG", "")
 WANT_GDB = os.environ.get("GDB", "0") == "1"
+GDB_COMMAND = os.environ.get("VIRTIO_GDB_COMMAND")
+HALT_COMMAND = os.environ.get("VIRTIO_HALT_COMMAND", "poweroff")
+POWEROFF_TIMEOUT = int(os.environ.get("VIRTIO_POWEROFF_TIMEOUT", "120"))
 
 LOGIN_TIMEOUT = 120
 # sshd comes up well after QEMU starts accepting connections, and pexpect
@@ -156,9 +163,9 @@ class GuestSession:
         return status, output
 
     def poweroff(self):
-        self.child.send("poweroff\r")
+        self.child.send(HALT_COMMAND + "\r")
         try:
-            self.child.expect(pexpect.EOF, timeout=120)
+            self.child.expect(pexpect.EOF, timeout=POWEROFF_TIMEOUT)
         except pexpect.TIMEOUT:
             pass
 
@@ -224,14 +231,21 @@ def gdb_dump(session):
     gdb sees the userspace stacks directly; that is the shortest path from
     "the command hung" to "this RPC is stuck here".
     """
-    session.run("command -v gdb >/dev/null || apt-get install -y gdb",
-                timeout=600)
+    if GDB_COMMAND:
+        status, out = session.run(f"command -v {GDB_COMMAND}")
+        if status != 0:
+            print(f"--- debugger {GDB_COMMAND} is unavailable ---", flush=True)
+            return
+    else:
+        session.run("command -v gdb >/dev/null || apt-get install -y gdb",
+                    timeout=600)
+    debugger = GDB_COMMAND or "gdb"
     status, out = session.run(
         "ps | awk '/hurd\\/(virtio-9p|9pfs)/ && !/awk/ {print $1}'")
     for pid in out.split():
         try:
             _, bt = session.run(
-                f"gdb -p {pid} -batch -ex 'thread apply all bt' 2>&1",
+                f"{debugger} -p {pid} -batch -ex 'thread apply all bt' 2>&1",
                 timeout=120)
             print(f"--- gdb bt of pid {pid} ---\n{bt}", flush=True)
         except GuestError as exc:
