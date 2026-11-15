@@ -15,7 +15,7 @@ The configuration comes from the environment:
     ROOT_PASSWORD     the password of the root account
     RUN_APT_UPGRADE   "1" runs "apt-get update" and "apt-get upgrade"
     GUEST_PACKAGES    the packages that the guest gets (default
-                      "curl python3")
+                      "curl python3 gdb")
     SSH_KEY_DIR       the directory with the SSH keys of the accounts
                       (default "img/keys")
 
@@ -598,7 +598,7 @@ def main():
     port = int(os.environ.get("SSH_PORT", "2222"))
     password = os.environ.get("ROOT_PASSWORD", "")
     run_apt_upgrade = os.environ.get("RUN_APT_UPGRADE", "0") == "1"
-    packages = os.environ.get("GUEST_PACKAGES", "curl python3").split()
+    packages = os.environ.get("GUEST_PACKAGES", "curl python3 gdb").split()
     key_dir = os.environ.get("SSH_KEY_DIR", "img/keys")
 
     try:

@@ -17,7 +17,7 @@ BACKEND   ?= hostlocal
 BINUTILS_VER := 2.46.1
 GCC_VER      := 15.3.0
 
-.PHONY: all toolchain toolchain-clean fetch binutils gcc1 gnumach glibc gcc2 mig hurd hurd-headers libpciaccess libtrivfs libirqhelp 9pfs verify-vm clean tooldir 3p-pin glibc-rebuild
+.PHONY: all toolchain toolchain-clean fetch binutils gcc1 gnumach glibc gcc2 mig hurd hurd-headers libpciaccess libtrivfs libirqhelp virtio-9p 9pfs verify-vm clean tooldir 3p-pin glibc-rebuild
 
 # The verified 3p checkouts, pinned to exact SHAs (see
 # stuff/crosscompile_plan.md, "3p source pins"). The shared 3p checkout is
@@ -71,7 +71,7 @@ all: toolchain
 
 ifeq ($(BACKEND),hostlocal)
 
-toolchain: 3p-pin fetch binutils gcc1 gnumach mig glibc gcc2 hurd libpciaccess libtrivfs libirqhelp 9pfs
+toolchain: 3p-pin fetch binutils gcc1 gnumach mig glibc gcc2 hurd libpciaccess libtrivfs libirqhelp 9pfs virtio-9p
 
 fetch: 3p-pin | $(SRC) $(BUILD)
 	cd $(SRC) && \
@@ -374,6 +374,20 @@ libirqhelp: hurd mig
 	    MIG=$(PREFIX)/bin/mig
 	@echo "=== gate: 9pfs ==="
 	file $(REPO_ROOT)/3p/9pfs/9pfs
+
+# The virtio-9p translator lives in its own repo (the standalone pattern of
+# 3p/9pfs, per the virtio plan: standalone repo first, subtree-merge into
+# 3p/hurd later); it links the cross prefix like 9pfs, plus libtrivfs and
+# libpciaccess, and stays uncommitted to the 3p trees.
+virtio-9p: hurd libpciaccess libtrivfs libirqhelp
+	$(MAKE) -C $(HOME)/src/virtio clean
+	$(MAKE) -C $(HOME)/src/virtio \
+	    PATH=$(PREFIX)/bin:$$PATH \
+	    CC=$(PREFIX)/bin/x86_64-gnu-gcc \
+	    CPATH=$(PREFIX)/include \
+	    LIBS="shouldbeinlibc ihash ports iohelp fshelp trivfs pciaccess hurduser machuser irqhelp"
+	@echo "=== gate: virtio-9p ==="
+	file $(HOME)/src/virtio/virtio-9p
 
 verify-vm: 9pfs
 	@echo "=== V2: ELF check ==="

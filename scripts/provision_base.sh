@@ -44,7 +44,7 @@ RUN_APT_UPGRADE="${RUN_APT_UPGRADE:-0}"
 
 # The packages that the guest gets. The list is configurable, so that the
 # image can carry other tools.
-GUEST_PACKAGES="${GUEST_PACKAGES:-curl python3}"
+GUEST_PACKAGES="${GUEST_PACKAGES:-curl python3 gdb}"
 
 if [[ ! -f "$BASE_IMG" ]]; then
     echo "Base image not found: $BASE_IMG" >&2

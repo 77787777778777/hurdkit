@@ -25,6 +25,7 @@ MEMORY        := 2G
 CPU_COUNT     := 4
 SSH_PORT      := 2222
 SSH_HOST      := 127.0.0.1
+REUSE         ?= 0
 ROOT_PASSWORD := abcdef
 # The in-VM package upgrade is off by default: the sid archive ships a
 # hurd-dev that cannot be unpacked on Hurd. Set it to 1 to run
@@ -32,10 +33,14 @@ ROOT_PASSWORD := abcdef
 RUN_APT_UPGRADE := 0
 # The packages that the guest gets during the provisioning. The list can be
 # changed, and the provisioning installs the packages that are missing.
-GUEST_PACKAGES := curl python3
+GUEST_PACKAGES := curl python3 gdb
 # The SSH keys of the guest accounts. The private keys stay in this
 # directory and are used to log into the guest without a password.
 SSH_KEY_DIR   := $(IMG_DIR)/keys
+# The host directory shared with the guest through virtio-9p, and the
+# standalone repo of the virtio-9p device translator.
+SHARE_DIR     := $(CURDIR)/$(IMG_DIR)/share
+VIRTIO_9P_BIN := $(HOME)/src/virtio/virtio-9p
 
 # Toolchain
 QEMU_SYSTEM   := qemu-system-x86_64
@@ -78,7 +83,7 @@ base: $(BASE_IMG)
 # interrupted build never leaves a partially written base image behind.
 # The preparation script is a prerequisite, so that changing it rebuilds
 # the base image.
-$(BASE_IMG): $(EXTRACT_STAMP) scripts/prepare_base.sh partitionfs-build
+$(BASE_IMG): $(EXTRACT_STAMP) scripts/prepare_base.sh $(PARTITIONFS)
 	@$(MKDIR_P) $(IMG_DIR)
 	@$(LOCK) $(LOCK_FILE) sh -c 'set -e; \
 		ROOT_PASSWORD=$(ROOT_PASSWORD) bash scripts/prepare_base.sh $(RAW_IMG) $(WORK_IMG); \
@@ -87,7 +92,7 @@ $(BASE_IMG): $(EXTRACT_STAMP) scripts/prepare_base.sh partitionfs-build
 		rm -f $(WORK_IMG)'
 
 # Provision the base image in-VM (idempotent: skips if already provisioned)
-provision: $(BASE_IMG) partitionfs-build
+provision: $(BASE_IMG) $(PARTITIONFS)
 	@$(MKDIR_P) $(IMG_DIR)
 	@$(LOCK) $(LOCK_FILE) env ROOT_PASSWORD=$(ROOT_PASSWORD) \
 		CPU_COUNT=$(CPU_COUNT) MEMORY=$(MEMORY) \
@@ -247,6 +252,23 @@ toolchain-clean:       ; $(MAKE) -C toolchain clean
 toolchain-docker: fetch-3p ; $(MAKE) -C toolchain toolchain BACKEND=docker
 hurd-build: fetch-3p   ; $(MAKE) -C toolchain hurd
 9pfs: fetch-3p         ; $(MAKE) -C toolchain 9pfs
+virtio-9p: fetch-3p    ; $(MAKE) -C toolchain virtio-9p
+
+# Boot the guest with a host directory shared through QEMU's virtio-9p
+# device and run the translator test matrix: the device selftest, the
+# 9pfs mount gate and the Phase 3 assertions (see scripts/virtio_test.sh).
+virtio-test: 9pfs virtio-9p $(BASE_IMG)
+	$(MKDIR_P) $(TMP_DIR) $(SHARE_DIR)
+	SSH_HOST="$(SSH_HOST)" SSH_PORT="$(SSH_PORT)" REUSE="$(REUSE)" \
+		bash scripts/virtio_test.sh
+# Shared-IRQ churn: add/exercise/remove the driver in a loop with network
+# traffic on the e1000 line shared with virtio-9p.  Targets the
+# registration/teardown path the one-shot matrix runs at most twice; see
+# scripts/virtio_test.py phase_stress.
+virtio-irq-stress: 9pfs virtio-9p $(BASE_IMG)
+	$(MKDIR_P) $(TMP_DIR) $(SHARE_DIR)
+	SSH_HOST="$(SSH_HOST)" SSH_PORT="$(SSH_PORT)" REUSE="$(REUSE)" \
+		MODE=stress bash scripts/virtio_test.sh
 verify-vm: fetch-3p    ; $(MAKE) -C toolchain verify-vm
 
 # Remove temporary overlay images

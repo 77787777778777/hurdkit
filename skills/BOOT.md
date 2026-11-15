@@ -165,7 +165,7 @@ base image and only replaces the base when everything succeeded:
      `/tmp/provision_<tag>.log`,
    - remove the "unreleased" suite from the apt sources and hold `hurd-dev`
      (see pitfalls 29 and 30),
-   - install the packages of `GUEST_PACKAGES` (`curl python3` by default) when
+   - install the packages of `GUEST_PACKAGES` (`curl python3 gdb` by default) when
      one of them is missing, and verify that every one of them is there
      afterwards,
    - rename the account `demo` to `peon`, together with its group and its
@@ -200,7 +200,7 @@ configuration files (`--force-confold`).
 
 The installation of the packages is **not** part of the upgrade and runs on
 every provisioning. The list comes from `GUEST_PACKAGES` in the `Makefile`
-(`curl python3` by default) and is passed through
+(`curl python3 gdb` by default) and is passed through
 `scripts/provision_base.sh` to the driver. The check is by command
 (`command -v`), so the installation is skipped when every package is already
 there: a provisioning of an already provisioned image stays a no-op, and a
