@@ -54,6 +54,7 @@ The 3p source checkouts (`mig`, `gnumach`, `glibc`, `hurd`, `9pfs`, `libpciacces
 | `make guix-screenshot` / `make guix-run` | Capture the VGA console / run in the foreground |
 | `make guix-repair` / `make guix-reset-state` | Repair / delete the kept Guix state |
 | `make guix-authorize-host` | Authorize the host signing key for Guix archive transfers |
+| `make guix-virtio-test` | Run the virtio-9p/9pfs matrix in a disposable Guix guest |
 | `make toolchain` | Build the x86_64-gnu cross toolchain |
 | `make toolchain-docker` | Same via Docker |
 | `make fetch-3p` | Clone missing 3p source checkouts |
