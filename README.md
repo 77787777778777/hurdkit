@@ -46,6 +46,14 @@ The 3p source checkouts (`mig`, `gnumach`, `glibc`, `hurd`, `9pfs`, `libpciacces
 | `make provision` | Provision the base image in-VM (idempotent) |
 | `make run` | Boot from an overlay; base stays unchanged |
 | `make ssh` / `make ssh-peon` | SSH into the running VM (port 2222) |
+| `make guix-image` | Build the Guix 64-bit GNU/Hurd image |
+| `make guix-start` / `make guix-stop` | Boot / stop the Guix guest (port 2223) |
+| `make guix-ssh` / `make guix-ssh-peon` | SSH into the Guix guest |
+| `make guix-start-persist` | Keep the Guix guest disk state between boots |
+| `make guix-status` | Check whether the Guix guest answers on SSH |
+| `make guix-screenshot` / `make guix-run` | Capture the VGA console / run in the foreground |
+| `make guix-repair` / `make guix-reset-state` | Repair / delete the kept Guix state |
+| `make guix-authorize-host` | Authorize the host signing key for Guix archive transfers |
 | `make toolchain` | Build the x86_64-gnu cross toolchain |
 | `make toolchain-docker` | Same via Docker |
 | `make fetch-3p` | Clone missing 3p source checkouts |
@@ -74,8 +82,11 @@ Tunables (image version, URL, MD5, memory, CPU count, SSH port, root password, g
 Makefile              # image pipeline + toolchain entry points
 nix/                  # flake.nix + flake.lock (development shell)
 toolchain/            # cross toolchain orchestration (host-local and docker backends)
-scripts/              # prepare_base.sh, provision_base.sh, provision_guest.py, repair_filesystem.sh, partition.sh
-skills/BOOT.md        # detailed boot/provisioning skill
+scripts/              # Debian pipeline and Guix guest management scripts
+guix/                 # Guix system declaration and driver packages
+guix.mk               # Guix guest make targets
+skills/BOOT.md        # detailed Debian boot/provisioning skill
+skills/GUIX.md        # Guix guest build, management and driver testing
 skills/CROSS_TESTING.md  # test cross-compiled drivers inside the Hurd VM
 img/                  # downloaded image, base image, keys (git ignored)
 3p/                   # pinned 3p source checkouts (git ignored)
@@ -90,3 +101,12 @@ make base          # builds img/hurd.base.qcow2
 make provision     # provisions it in the VM
 make run           # boots from an overlay, SSH on 127.0.0.1:2222
 ```
+
+## Guix guest (64-bit GNU/Hurd)
+
+The Guix guest is built from `guix/hurd64.scm` with the goonix revision pinned
+in `nix/flake.lock`. It uses the same SSH keys and account names as the Debian
+guest, and boots from overlays so its base image stays unchanged. Use
+`nix develop ./nix#guix`, then `make guix-image`, `make guix-start`,
+`make guix-ssh`, and `make guix-stop`. See [skills/GUIX.md](skills/GUIX.md)
+for persistent state, host archive trust, and driver testing.
