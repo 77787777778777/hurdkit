@@ -180,7 +180,8 @@ tooldir:
 	    if [ -n "$$(find $(PREFIX)/x86_64-gnu/lib -mindepth 1 -maxdepth 1 ! -name ldscripts -print -quit)" ]; then \
 	        echo "tooldir: leaving existing lib directory"; \
 	    else \
-	        cp -a $(PREFIX)/x86_64-gnu/lib/ldscripts $(PREFIX)/lib/ldscripts; \
+	        mkdir -p $(PREFIX)/lib/ldscripts; \
+	        cp -a $(PREFIX)/x86_64-gnu/lib/ldscripts/. $(PREFIX)/lib/ldscripts/; \
 	        rm -rf $(PREFIX)/x86_64-gnu/lib; \
 	        ln -sT $(PREFIX)/lib $(PREFIX)/x86_64-gnu/lib; \
 	    fi; \

@@ -74,7 +74,9 @@ provisioning_is_noop() {
     command -v partx >/dev/null 2>&1 || return 1
     # shellcheck source=scripts/partition.sh
     source "$SCRIPT_DIR/partition.sh"
-    probe_dir="$(mktemp -d)"
+    # The probe holds a raw copy of the image (gigabytes, sparse): keep it
+    # next to the image, not in a TMPDIR that may be a RAM-backed tmpfs.
+    probe_dir="$(mktemp -d "$(dirname "$BASE_IMG")/.provision-probe.XXXXXX")"
     # partx and debugfs operate on raw bytes. Use a temporary sparse raw
     # conversion instead of booting or exposing the base through a writable
     # helper. This reads the image but cannot change its contents.
