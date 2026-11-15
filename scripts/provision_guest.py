@@ -287,6 +287,7 @@ def install_packages(session, packages):
     print(f"Installing {' and '.join(packages)}...", flush=True)
     status = session.run_command(
         "DEBIAN_FRONTEND=noninteractive apt-get -y "
+        "-o Dpkg::Options::=--force-confold "
         "-o APT::Install-Recommends=false install " + " ".join(packages),
         "apt_install",
     )
@@ -566,7 +567,6 @@ def upgrade_packages(session):
 
 def provision(session, run_apt_upgrade, packages, key_dir, password):
     disable_unreleased_suite(session)
-    hold_hurd_dev(session)
 
     # The packages are installed on every run, not only on the first one:
     # a package that is added to the list has to reach the images that
@@ -584,6 +584,13 @@ def provision(session, run_apt_upgrade, packages, key_dir, password):
         return key_pairs
 
     if run_apt_upgrade:
+        # Keep hurd-dev at the version that is installed. The hurd-dev
+        # package from sid cannot be unpacked on Hurd: dpkg fails with
+        # "unable to install new version of .../linux-headers/linux/hdlc",
+        # because the new version wants to replace a directory with a file.
+        # The package is held and pinned below zero, so that an upgrade
+        # cannot select the broken version.
+        hold_hurd_dev(session)
         upgrade_packages(session)
     else:
         print("Skipping apt update and apt upgrade (RUN_APT_UPGRADE is not set).", flush=True)
