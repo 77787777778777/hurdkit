@@ -66,8 +66,12 @@ BASE_IMG="$(cd "$(dirname "$BASE_IMG")" && pwd)/$(basename "$BASE_IMG")"
 BASE_DIR="$(dirname "$BASE_IMG")"
 
 # The working copy lives next to the base image so that replacing the base
-# image is a rename within the same filesystem.
+# image is a rename within the same filesystem. It is an overlay directly on
+# BASE_IMG: creation is near-instant and the guest writes only to the
+# overlay, so a failed or interrupted provisioning never touches BASE_IMG and
+# no slow full-image conversion is needed up front.
 WORK_IMG="$(mktemp -p "$BASE_DIR" .provision.XXXXXX.qcow2)"
+qemu-img create -f qcow2 -b "$BASE_IMG" -F qcow2 "$WORK_IMG"
 # The SSH keys of the guest accounts live next to the base image. They are
 # private keys, so the directory is only readable by the owner.
 SSH_KEY_DIR="${SSH_KEY_DIR:-$BASE_DIR/keys}"
@@ -80,13 +84,9 @@ cleanup() {
         kill "$QEMU_PID" 2>/dev/null || true
         wait "$QEMU_PID" 2>/dev/null || true
     fi
-    rm -f "$QEMU_LOG" "$WORK_IMG"
+    rm -f "$QEMU_LOG" "$WORK_IMG" "$BASE_IMG.tmp"
 }
 trap cleanup EXIT
-
-# A standalone copy: the guest writes to it directly, and the base image is
-# only replaced once the guest has powered off successfully.
-qemu-img convert -f qcow2 -O qcow2 "$BASE_IMG" "$WORK_IMG"
 
 # KVM is used when it is available; without it the guest runs under
 # emulation, which is much slower but works.
@@ -211,8 +211,13 @@ QEMU_PID=""
 # partition, so no conversion is needed.
 bash "$SCRIPT_DIR/repair_filesystem.sh" "$WORK_IMG"
 
-# Replace the base image with the provisioned copy.
-mv -f "$WORK_IMG" "$BASE_IMG"
+# Flatten the provisioned overlay into the new base image. The overlay
+# contains only the changes the guest made; it is read through the backing
+# chain (BASE_IMG) and written as a standalone image, then swapped in with a
+# rename so a failed flatten never leaves a half-written base image behind.
+qemu-img convert -f qcow2 -O qcow2 "$WORK_IMG" "$BASE_IMG.tmp"
+mv -f "$BASE_IMG.tmp" "$BASE_IMG"
+rm -f "$WORK_IMG"
 trap - EXIT
 rm -f "$QEMU_LOG"
 
