@@ -84,11 +84,12 @@ Makefile              # image pipeline + toolchain entry points
 nix/                  # flake.nix + flake.lock (development shell)
 toolchain/            # cross toolchain orchestration (host-local and docker backends)
 scripts/              # Debian pipeline and Guix guest management scripts
-guix/                 # Guix system declaration and driver packages
+guix/                 # Guix system declaration, goonix and driver packages
 guix.mk               # Guix guest make targets
 skills/BOOT.md        # detailed Debian boot/provisioning skill
 skills/GUIX.md        # Guix guest build, management and driver testing
 skills/CROSS_TESTING.md  # test cross-compiled drivers inside the Hurd VM
+tests/                # TAP tests of the scripts (run each with bash)
 img/                  # downloaded image, base image, keys (git ignored)
 3p/                   # pinned 3p source checkouts (git ignored)
 ```
@@ -105,9 +106,12 @@ make run           # boots from an overlay, SSH on 127.0.0.1:2222
 
 ## Guix guest (64-bit GNU/Hurd)
 
-The Guix guest is built from `guix/hurd64.scm` with the goonix revision pinned
-in `nix/flake.lock`. It uses the same SSH keys and account names as the Debian
-guest, and boots from overlays so its base image stays unchanged. Use
+The Guix guest is built from `guix/hurd64.scm` with goonix, our fork of Guix,
+at the revision pinned in `nix/flake.lock`; the guest's own Guix is the same
+goonix commit (`guix/goonix.scm`). It uses the same SSH keys and account names
+as the Debian guest, and boots from overlays so its base image stays
+unchanged. The host needs a Guix daemon, on NixOS `services.guix` with
+goonix as its package (see [skills/GUIX.md](skills/GUIX.md)). Use
 `nix develop ./nix#guix`, then `make guix-image`, `make guix-start`,
 `make guix-ssh`, and `make guix-stop`. See [skills/GUIX.md](skills/GUIX.md)
 for persistent state, host archive trust, and driver testing.
