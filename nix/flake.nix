@@ -3,8 +3,13 @@
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
+  # goonix is our fork of GNU Guix. flake.lock pins the exact commit of it;
+  # that pin is what replaces Guix channels and "guix pull" here. Our work is
+  # on its goonix branch; its main branch mirrors upstream Guix.
+  inputs.goonix.url = "github:hurdkit/goonix/goonix";
+
   outputs =
-    { self, nixpkgs }:
+    { self, nixpkgs, goonix }:
     let
       # The toolchain is configured with --build=x86_64-pc-linux-gnu and the
       # guest is an x86_64 VM, so this is the only supported host.
@@ -87,6 +92,16 @@
               echo "hurdkit: /dev/fuse is not usable, 'make provision' needs FUSE for the offline repair" >&2
             fi
           '';
+        };
+
+        # The default shell plus the `guix` command of the pinned goonix,
+        # for the Guix GNU/Hurd targets (make guix-image, guix-run, ...).
+        # It is a separate shell because building goonix takes about half
+        # an hour and the Debian pipeline does not need it.
+        guix = pkgs.mkShell {
+          name = "hurdkit-guix";
+          inputsFrom = [ self.devShells.${system}.default ];
+          packages = [ goonix.packages.${system}.default ];
         };
       };
     };
