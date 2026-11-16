@@ -69,6 +69,11 @@ SSH_KEY_DIR   := $(IMG_DIR)/keys
 SHARE_DIR     := $(CURDIR)/$(IMG_DIR)/share
 VIRTIO_DIR    ?= $(HOME)/src/virtio
 VIRTIO_9P_BIN := $(VIRTIO_DIR)/virtio-9p
+# The gnumach source checkout used for the kernel build. Override this to
+# build a worktree instead of the pinned 3p checkout.
+GNUMACH_DIR   ?= 3p/gnumach
+# Number of CPUs configured in the gnumach kernel.
+GNUMACH_NCPUS ?= 1
 
 # Toolchain
 QEMU_SYSTEM   := qemu-system-x86_64
@@ -82,7 +87,12 @@ RM            := rm -f
 LOCK          := flock
 LOCK_FILE     := $(IMG_DIR)/.build.lock
 
-.PHONY: all download check base accounts packages kernel provision stage run run-nokvm ssh ssh-peon clean distclean toolchain toolchain-clean toolchain-docker verify-vm hurd-build gnumach-kernel 9pfs fetch-3p virtio-blk virtio-blk-test
+.PHONY: all download check base accounts packages kernel provision stage \
+	run run-nokvm ssh ssh-peon \
+	clean distclean \
+	toolchain toolchain-clean toolchain-docker \
+	verify-vm hurd-build \
+	gnumach-kernel smp-kernel 9pfs fetch-3p virtio-blk virtio-blk-test
 
 # The default builds the whole image pipeline, with every intermediate
 # exposed as its own qcow2 (see the stage rules below).
@@ -295,7 +305,10 @@ toolchain: fetch-3p    ; $(MAKE) -C toolchain toolchain
 toolchain-clean:       ; $(MAKE) -C toolchain clean
 toolchain-docker: fetch-3p ; $(MAKE) -C toolchain toolchain BACKEND=docker
 hurd-build: fetch-3p   ; $(MAKE) -C toolchain hurd
-gnumach-kernel: fetch-3p ; $(MAKE) -C toolchain gnumach-kernel
+gnumach-kernel: fetch-3p ; $(MAKE) -C toolchain gnumach-kernel \
+	GNUMACH_DIR=$(abspath $(GNUMACH_DIR)) GNUMACH_NCPUS=$(GNUMACH_NCPUS)
+smp-kernel: fetch-3p ; $(MAKE) -C toolchain gnumach-kernel \
+	GNUMACH_DIR=$(abspath $(GNUMACH_DIR)) GNUMACH_NCPUS=2
 9pfs: fetch-3p         ; $(MAKE) -C toolchain 9pfs
 virtio-9p: fetch-3p    ; $(MAKE) -C toolchain virtio-9p VIRTIO_DIR=$(VIRTIO_DIR)
 virtio-balloon: fetch-3p    ; $(MAKE) -C toolchain virtio-balloon VIRTIO_DIR=$(VIRTIO_DIR)

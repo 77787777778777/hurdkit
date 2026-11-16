@@ -13,6 +13,12 @@ BUILD     := $(HOME)/work/x86_64-gnu-build
 SRC       := $(HOME)/work/x86_64-gnu-src
 NPROC     := $(shell nproc)
 BACKEND   ?= hostlocal
+# Build the kernel from a separate worktree when GNUMACH_DIR is overridden.
+GNUMACH_DIR ?= $(REPO_ROOT)/3p/gnumach
+# Keep the stable uniprocessor build as the default until SMP is verified.
+GNUMACH_NCPUS ?= 1
+GNUMACH_NCPUS_IS_SMP := $(shell test "$(GNUMACH_NCPUS)" -gt 1 2>/dev/null && echo yes)
+GNUMACH_NCPUS_OPTION := $(if $(GNUMACH_NCPUS_IS_SMP),--enable-ncpus=$(GNUMACH_NCPUS))
 
 BINUTILS_VER := 2.46.1
 GCC_VER      := 15.3.0
@@ -172,14 +178,19 @@ gnumach: gcc1
 # plain make afterwards needs no overrides.  A build dir configured
 # without them must be reconfigured, never built in place by hand.
 gnumach-kernel: gnumach mig
+	@case "$(GNUMACH_NCPUS)" in \
+	    ''|*[!0-9]*) echo "gnumach-kernel: GNUMACH_NCPUS must be a positive integer" >&2; exit 1 ;; \
+	esac; \
+	test "$(GNUMACH_NCPUS)" -ge 1 || { echo "gnumach-kernel: GNUMACH_NCPUS must be at least 1" >&2; exit 1; }
 	rm -rf $(BUILD)/gnumach-kernel-src $(BUILD)/gnumach-kernel
-	cp -a $(REPO_ROOT)/3p/gnumach $(BUILD)/gnumach-kernel-src
+	cp -a $(GNUMACH_DIR) $(BUILD)/gnumach-kernel-src
 	cd $(BUILD)/gnumach-kernel-src && autoreconf -i
 	mkdir -p $(BUILD)/gnumach-kernel && cd $(BUILD)/gnumach-kernel && \
 	    PATH=$(PREFIX)/bin:$$PATH \
 	    CC=$(PREFIX)/bin/x86_64-gnu-gcc MIG=$(PREFIX)/bin/mig \
 	    $(BUILD)/gnumach-kernel-src/configure --prefix=$(PREFIX) \
-	        --host=x86_64-gnu --build=x86_64-pc-linux-gnu && \
+	        --host=x86_64-gnu --build=x86_64-pc-linux-gnu \
+	        $(GNUMACH_NCPUS_OPTION) && \
 	    PATH=$(PREFIX)/bin:$$PATH make -j$(NPROC)
 	@echo "=== gate: gnumach kernel ==="
 	grep -q '^CC = $(PREFIX)/bin/x86_64-gnu-gcc$$' $(BUILD)/gnumach-kernel/Makefile || { echo "gnumach-kernel: Makefile did not record the cross compiler" >&2; exit 1; }
@@ -188,6 +199,12 @@ gnumach-kernel: gnumach mig
 	$(PREFIX)/bin/x86_64-gnu-nm $(BUILD)/gnumach-kernel/gnumach | \
 	    grep -q irq_disable_count_held && \
 	    echo "gate: kernel carries the shared-IRQ fixes (irq_disable_count_held)"
+ifeq ($(GNUMACH_NCPUS_IS_SMP),yes)
+	grep -q '^#define NCPUS $(GNUMACH_NCPUS)$$' $(BUILD)/gnumach-kernel/config.h || { echo "gnumach-kernel: config.h has the wrong NCPUS" >&2; exit 1; }
+	grep -q '^#define MULTIPROCESSOR 1$$' $(BUILD)/gnumach-kernel/config.h || { echo "gnumach-kernel: config.h does not enable MULTIPROCESSOR" >&2; exit 1; }
+	$(PREFIX)/bin/x86_64-gnu-nm $(BUILD)/gnumach-kernel/gnumach | grep -q ' smp_init$$' || { echo "gnumach-kernel: smp_init is missing" >&2; exit 1; }
+	$(PREFIX)/bin/x86_64-gnu-nm $(BUILD)/gnumach-kernel/gnumach | grep -q ' smp_startup_cpus$$' || { echo "gnumach-kernel: smp_startup_cpus is missing" >&2; exit 1; }
+endif
 
 # Hurd's interface definitions (.defs) are compiled by glibc's MIG rules
 # before the Hurd libraries themselves are built, so install the public
