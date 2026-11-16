@@ -6,7 +6,7 @@
 # Clone URLs for the 3p checkouts (keyed by repo name, "repo:url").
 3P_REPOS := \
 	mig:https://git.savannah.gnu.org/git/hurd/mig.git \
-	gnumach:https://git.savannah.gnu.org/git/hurd/gnumach.git \
+	gnumach:https://github.com/hurdkit/gnumach.git \
 	glibc:https://sourceware.org/git/glibc.git \
 	hurd:https://github.com/joshumax/hurd.git \
 	9pfs:https://github.com/bugaevc/9pfs.git \
@@ -14,10 +14,14 @@
 
 # Verified commits the toolchain builds against (keyed by repo name,
 # "repo:sha"). Matches the 3P_PINS that used to live in toolchain/Makefile.
+# gnumach is pinned to a branch instead of a hash ("repo:@branch"): the pin
+# checkout tracks that branch, so an upstream push moves the build forward
+# with it. The gnumach hurdkit branch carries the shared-IRQ fixes the
+# balloon driver's test matrix depends on.
 3P_PINS := \
 	mig:cb48044b30fcfe10529ecc1129dd68e93ed73835 \
 	glibc:03628c2f85acaab6ef71c37c954fd0707685e0f0 \
-	gnumach:12a3efa846b574070f90aa0c22c3f3e67cca10c4 \
+	gnumach:@hurdkit \
 	hurd:9b556c6ad91197125bff8261462f51b024ad8e00 \
 	9pfs:b5b23deb1df6eb383fd2c0f5271c068861b745a8 \
 	libpciaccess:e33aa5fd28f63b9842e36c1a8a954577eec042e3

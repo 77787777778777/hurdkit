@@ -17,7 +17,7 @@ BACKEND   ?= hostlocal
 BINUTILS_VER := 2.46.1
 GCC_VER      := 15.3.0
 
-.PHONY: all toolchain toolchain-clean fetch binutils gcc1 gnumach glibc gcc2 mig hurd hurd-headers libpciaccess libtrivfs libirqhelp virtio-9p 9pfs verify-vm clean tooldir 3p-pin glibc-rebuild
+.PHONY: all toolchain toolchain-clean fetch binutils gcc1 gnumach gnumach-kernel glibc gcc2 mig hurd hurd-headers libpciaccess libtrivfs libirqhelp virtio-9p virtio-balloon 9pfs verify-vm clean tooldir 3p-pin glibc-rebuild
 
 # The verified 3p checkouts, pinned to exact SHAs (see
 # stuff/crosscompile_plan.md, "3p source pins"). The shared 3p checkout is
@@ -27,10 +27,12 @@ GCC_VER      := 15.3.0
 # with the top-level Makefile, whose fetch-3p target clones the checkouts.
 include pins.mk
 
-# Pin the 3p repos to the verified SHAs. No-op when already pinned. Refuses
-# to proceed if a repo has uncommitted changes (it may be shared with other
-# work) or if the pinned commit is unavailable (network or wrong checkout;
-# restore the pinned 3p tree).
+# Pin the 3p repos to their pins.mk refs: an exact SHA (detached HEAD) or,
+# with an "@branch" pin, the named branch checked out with tracking, so an
+# upstream push moves the pin forward on the next 3p-pin run. No-op when
+# already pinned. Refuses to proceed if a repo has uncommitted changes (it
+# may be shared with other work) or if the pinned commit is unavailable
+# (network or wrong checkout; restore the pinned 3p tree).
 3p-pin:
 	@set -e; \
 	for spec in $(3P_PINS); do \
@@ -42,24 +44,50 @@ include pins.mk
 	    git -C $$dir rev-parse --git-dir >/dev/null 2>&1 || { \
 	        echo "3p-pin: $$dir is not a git repo"; exit 1; \
 	    }; \
-	    if ! git -C $$dir cat-file -e $$sha^{commit} 2>/dev/null; then \
-	        echo "3p-pin: $$repo: pinned commit $$sha not present locally; fetching from $$remote"; \
-	        git -C $$dir fetch $$remote $$sha || { \
-	            echo "3p-pin: fetch failed for $$repo; restore the pinned 3p checkout"; \
+	    if [ "$${sha#@}" != "$$sha" ]; then \
+	        branch=$${sha#@}; \
+	        if ! git -C $$dir rev-parse -q --verify "refs/heads/$$branch" >/dev/null; then \
+	            echo "3p-pin: $$repo: branch $$branch not present locally; fetching from $$remote"; \
+	            git -C $$dir fetch $$remote "$$branch:$$branch" || { \
+	                echo "3p-pin: fetch failed for $$repo; restore the pinned 3p checkout"; \
+	                exit 1; \
+	            }; \
+	        fi; \
+	        if ! git -C $$dir diff --quiet || ! git -C $$dir diff --cached --quiet; then \
+	            echo "3p-pin: $$repo has uncommitted changes; commit or stash them before pinning"; \
 	            exit 1; \
-	        }; \
-	    fi; \
-	    if ! git -C $$dir diff --quiet || ! git -C $$dir diff --cached --quiet; then \
-	        echo "3p-pin: $$repo has uncommitted changes; commit or stash them before pinning"; \
-	        exit 1; \
-	    fi; \
-	    cur=$$(git -C $$dir rev-parse HEAD); \
-	    if [ "$$cur" = "$$sha" ]; then \
-	        echo "3p-pin: $$repo already at pinned commit $$sha"; \
+	        fi; \
+	        cur=$$(git -C $$dir rev-parse --abbrev-ref HEAD); \
+	        if [ "$$cur" = "$$branch" ]; then \
+	            echo "3p-pin: $$repo already on branch $$branch"; \
+	            git -C $$dir fetch $$remote "$$branch" || true; \
+	            git -C $$dir merge --ff-only "$$remote/$$branch" >/dev/null 2>&1 || true; \
+	        else \
+	            echo "3p-pin: $$repo $$cur -> branch $$branch"; \
+	            git -C $$dir checkout "$$branch" --; \
+	        fi; \
+	        git -C $$dir fetch $$remote >/dev/null 2>&1 || true; \
+	        git -C $$dir branch --set-upstream-to=$$remote/$$branch "$$branch" >/dev/null 2>&1 || true; \
 	    else \
-	        echo "3p-pin: $$repo $$cur -> $$sha (detached HEAD)"; \
-	        echo "3p-pin: ('git -C 3p/$$repo checkout <branch>' to move back)"; \
-	        git -C $$dir checkout --detach $$sha; \
+	        if ! git -C $$dir cat-file -e $$sha^{commit} 2>/dev/null; then \
+	            echo "3p-pin: $$repo: pinned commit $$sha not present locally; fetching from $$remote"; \
+	            git -C $$dir fetch $$remote $$sha || { \
+	                echo "3p-pin: fetch failed for $$repo; restore the pinned 3p checkout"; \
+	                exit 1; \
+	            }; \
+	        fi; \
+	        if ! git -C $$dir diff --quiet || ! git -C $$dir diff --cached --quiet; then \
+	            echo "3p-pin: $$repo has uncommitted changes; commit or stash them before pinning"; \
+	            exit 1; \
+	        fi; \
+	        cur=$$(git -C $$dir rev-parse HEAD); \
+	        if [ "$$cur" = "$$sha" ]; then \
+	            echo "3p-pin: $$repo already at pinned commit $$sha"; \
+	        else \
+	            echo "3p-pin: $$repo $$cur -> $$sha (detached HEAD)"; \
+	            echo "3p-pin: ('git -C 3p/$$repo checkout <branch>' to move back)"; \
+	            git -C $$dir checkout --detach $$sha; \
+	        fi; \
 	    fi; \
 	done
 
@@ -132,6 +160,34 @@ gnumach: gcc1
 	ls $(PREFIX)/include/mach/machine/vm_types.h >/dev/null
 	ls $(PREFIX)/include/mach/message.h >/dev/null
 	ls $(PREFIX)/include/mach/exc.defs >/dev/null
+
+# Build the gnumach kernel binary itself (the gnumach target above only
+# installs its headers), from the pinned 3p/gnumach checkout, for use as
+# CUSTOM_KERNEL in a kernel-stage image (see the top-level Makefile).  The
+# kernel needs -mcmodel=kernel, which only the cross gcc accepts; configure
+# run without the cross tools in PATH silently records the host "CC = gcc"
+# and only the build fails later (with broken objects, e.g. an empty symbol
+# table).  So CC and MIG are passed to configure -- AC_ARG_VAR(MIG) and the
+# standard CC override put them into the generated Makefile -- and the
+# plain make afterwards needs no overrides.  A build dir configured
+# without them must be reconfigured, never built in place by hand.
+gnumach-kernel: gnumach mig
+	rm -rf $(BUILD)/gnumach-kernel-src $(BUILD)/gnumach-kernel
+	cp -a $(REPO_ROOT)/3p/gnumach $(BUILD)/gnumach-kernel-src
+	cd $(BUILD)/gnumach-kernel-src && autoreconf -i
+	mkdir -p $(BUILD)/gnumach-kernel && cd $(BUILD)/gnumach-kernel && \
+	    PATH=$(PREFIX)/bin:$$PATH \
+	    CC=$(PREFIX)/bin/x86_64-gnu-gcc MIG=$(PREFIX)/bin/mig \
+	    $(BUILD)/gnumach-kernel-src/configure --prefix=$(PREFIX) \
+	        --host=x86_64-gnu --build=x86_64-pc-linux-gnu && \
+	    PATH=$(PREFIX)/bin:$$PATH make -j$(NPROC)
+	@echo "=== gate: gnumach kernel ==="
+	grep -q '^CC = $(PREFIX)/bin/x86_64-gnu-gcc$$' $(BUILD)/gnumach-kernel/Makefile || { echo "gnumach-kernel: Makefile did not record the cross compiler" >&2; exit 1; }
+	file $(BUILD)/gnumach-kernel/gnumach
+	file $(BUILD)/gnumach-kernel/gnumach | grep -q 'ELF 64-bit.*statically linked' || { echo "gnumach-kernel: kernel binary is not a static x86-64 ELF" >&2; exit 1; }
+	$(PREFIX)/bin/x86_64-gnu-nm $(BUILD)/gnumach-kernel/gnumach | \
+	    grep -q irq_disable_count_held && \
+	    echo "gate: kernel carries the shared-IRQ fixes (irq_disable_count_held)"
 
 # Hurd's interface definitions (.defs) are compiled by glibc's MIG rules
 # before the Hurd libraries themselves are built, so install the public
@@ -373,19 +429,35 @@ libirqhelp: hurd mig
 	@echo "=== gate: 9pfs ==="
 	file $(REPO_ROOT)/3p/9pfs/9pfs
 
-# The virtio-9p translator lives in its own repo (the standalone pattern of
+# The virtio drivers live in their own repo (the standalone pattern of
 # 3p/9pfs, per the virtio plan: standalone repo first, subtree-merge into
-# 3p/hurd later); it links the cross prefix like 9pfs, plus libtrivfs and
-# libpciaccess, and stays uncommitted to the 3p trees.
+# 3p/hurd later); they link the cross prefix like 9pfs, plus libtrivfs and
+# libpciaccess, and stay uncommitted to the 3p trees.  VIRTIO_DIR selects
+# which checkout is built, so a workbranch can be tested in place.
+VIRTIO_DIR ?= $(HOME)/src/virtio
+
 virtio-9p: hurd libpciaccess libtrivfs libirqhelp
-	$(MAKE) -C $(HOME)/src/virtio clean
-	$(MAKE) -C $(HOME)/src/virtio \
+	$(MAKE) -C $(VIRTIO_DIR) clean
+	$(MAKE) -C $(VIRTIO_DIR) \
 	    PATH=$(PREFIX)/bin:$$PATH \
 	    CC=$(PREFIX)/bin/x86_64-gnu-gcc \
 	    CPATH=$(PREFIX)/include \
 	    LIBS="shouldbeinlibc ihash ports iohelp fshelp trivfs pciaccess hurduser machuser irqhelp"
 	@echo "=== gate: virtio-9p ==="
-	file $(HOME)/src/virtio/virtio-9p
+	file $(VIRTIO_DIR)/virtio-9p
+
+# The repo Makefile's default target builds the translator and both
+# daemons in one pass, so this reuses the same invocation and gates on the
+# balloon binary.
+virtio-balloon: hurd libpciaccess libirqhelp
+	$(MAKE) -C $(VIRTIO_DIR) clean
+	$(MAKE) -C $(VIRTIO_DIR) \
+	    PATH=$(PREFIX)/bin:$$PATH \
+	    CC=$(PREFIX)/bin/x86_64-gnu-gcc \
+	    CPATH=$(PREFIX)/include \
+	    LIBS="shouldbeinlibc ihash ports iohelp fshelp trivfs pciaccess hurduser machuser irqhelp"
+	@echo "=== gate: virtio-balloon ==="
+	file $(VIRTIO_DIR)/virtio-balloon
 
 verify-vm: 9pfs
 	@echo "=== V2: ELF check ==="
