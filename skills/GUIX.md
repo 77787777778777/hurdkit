@@ -178,6 +178,8 @@ programs in it; `scripts/stage1_check.sh` lists them. The guest has:
   zero, so the file's mappings keep working. `tmpfs-shm DIRECTORY`
   (`tests/hurd/tmpfs-shm.c`) checks it on `/dev/shm`, and on ext2 as the
   control; it also runs on Linux.
+- `hurd-shm` and `gnumach-shm`, which add the fixes that shared memory on a
+  tmpfs needs from the default pager and from GNU Mach (G22).
 - `hurd-epoll-shim`, the epoll, eventfd, timerfd and signalfd library for
   the libwayland port, with its TAP suites (`hurd-epoll-shim-test-NAME`).
   It lives in its own repository, github.com/hurdkit/hurd-epoll-shim, and
@@ -273,11 +275,12 @@ pressure go to the default pager, which has nowhere to write them: the
 serial log shows `(default pager): data_return write error, losing data`,
 and every later page-in of that memory object fails (SIGBUS). The same two
 lines after a tmpfs file is deleted are harmless: the kernel returns the
-dirty pages of an object that is going away. Two operations lose shared
-memory without any memory pressure: `msync` on a tmpfs file or on anonymous
-shared memory, and truncating a tmpfs file in the middle of a resident
-page, which stops GNU Mach in its debugger (`vm_map_copyin_page_list:
-Assertion 'm->wire_count == 1'`).
+dirty pages of an object that is going away. `hurd-shm` and `gnumach-shm`
+fix the two cases that lost shared memory without any memory pressure: a
+tmpfs file truncated in the middle of a resident page stopped GNU Mach in
+its debugger (`vm_map_copyin_page_list: Assertion 'm->wire_count == 1'`),
+and `msync` moved the pages of tmpfs files and anonymous shared memory to
+the default pager. Their patches are in `guix/patches/`.
 
 **G23. The newer Hurd's `make -j` is racy.** `utils/` fails with `No rule to
 make target 'auth_requestUser.stamp'`, often enough that `hurd-hurdkit`

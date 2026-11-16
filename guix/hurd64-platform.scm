@@ -9,8 +9,8 @@
              (hurdkit packages tests))
 
 (define os
-  (operating-system-with-hurd (load "hurd64.scm") hurd-tmpfs-mapped
-                              #:kernel gnumach-hurdkit))
+  (operating-system-with-hurd (load "hurd64.scm") hurd-shm
+                              #:kernel gnumach-shm))
 
 (operating-system
   (inherit os)

@@ -8,9 +8,11 @@
    instead of the whole run.  The output is TAP.  It runs on Linux too
    (DIRECTORY=/dev/shm), which checks the expectations themselves.
 
-   The cases keep their files resident, and none of them calls msync or
-   shrinks a file in the middle of a page: on a Hurd without swap that
-   loses the pages or stops GNU Mach (see G22 in skills/GUIX.md).  */
+   Without the fixes of hurd-shm and gnumach-shm, the shrink cases stop
+   GNU Mach in its debugger (vm_map_copyin_page_list: Assertion
+   `m->wire_count == 1'), and the msync cases lose the pages of a guest
+   that has no swap.  Nothing here puts the guest under memory pressure:
+   without swap, pages that the kernel evicts are still lost.  */
 
 #define _GNU_SOURCE
 #include <errno.h>
@@ -175,6 +177,89 @@ unmap_and_remap (void)
   return check (map, length, 0, 4);
 }
 
+/* Shrinking an open unlinked file and growing it again leaves zeros in
+   the regrown part, whether read or mapped.  */
+static int
+shrink_and_regrow (int keep_link)
+{
+  char path[4096];
+  size_t length = 2 * page_size, kept = 10;
+  unsigned char *buffer = malloc (length);
+  int fd = new_file (keep_link, path, sizeof path);
+  if (fd < 0 || buffer == NULL || ftruncate (fd, length) < 0)
+    return fail ("create");
+  unsigned char *map = mmap (NULL, length, PROT_READ | PROT_WRITE,
+                             MAP_SHARED, fd, 0);
+  if (map == MAP_FAILED)
+    return fail ("mmap");
+  memset (map, 'A', length);
+  if (ftruncate (fd, kept) < 0 || ftruncate (fd, length) < 0)
+    return fail ("ftruncate");
+  if (pread (fd, buffer, length, 0) != (ssize_t) length)
+    return fail ("pread");
+  for (size_t i = 0; i < length; i++)
+    if (buffer[i] != (i < kept ? 'A' : 0) || map[i] != buffer[i])
+      {
+        fprintf (stderr, "# byte %zu: read %u, mapped %u\n", i, buffer[i],
+                 map[i]);
+        return 1;
+      }
+  if (keep_link)
+    unlink (path);
+  return 0;
+}
+
+/* msync has nothing to write for memory that only the default pager
+   backs, and must not lose it: the data stays, in the mapping and for
+   read, pages that were never touched still read as zeros, and the
+   mapping takes new writes.  With FILE_BACKED the memory is an unlinked
+   file of DIRECTORY, otherwise anonymous shared memory.  */
+static int
+msync_keeps_data (int file_backed)
+{
+  char path[4096];
+  size_t length = 4 * page_size, used = length - page_size;
+  unsigned char *buffer = malloc (length);
+  int fd = -1;
+  if (buffer == NULL)
+    return fail ("malloc");
+  if (file_backed)
+    {
+      fd = new_file (0, path, sizeof path);
+      if (fd < 0 || ftruncate (fd, length) < 0)
+        return fail ("create");
+    }
+  unsigned char *map = mmap (NULL, length, PROT_READ | PROT_WRITE,
+                             MAP_SHARED | (file_backed ? 0 : MAP_ANONYMOUS),
+                             fd, 0);
+  if (map == MAP_FAILED)
+    return fail ("mmap");
+  fill (map, used, 0, 5);
+  if (msync (map, length, MS_SYNC) < 0)
+    return fail ("msync (MS_SYNC)");
+  if (check (map, used, 0, 5))
+    return 1;
+  if (msync (map, length, MS_SYNC | MS_INVALIDATE) < 0)
+    return fail ("msync (MS_SYNC | MS_INVALIDATE)");
+  if (check (map, used, 0, 5))
+    return 1;
+  if (file_backed)
+    {
+      if (pread (fd, buffer, length, 0) != (ssize_t) length)
+        return fail ("pread");
+      if (check (buffer, used, 0, 5))
+        return 1;
+    }
+  for (size_t i = used; i < length; i++)
+    if (map[i] != 0)
+      {
+        fprintf (stderr, "# untouched byte %zu is %u\n", i, map[i]);
+        return 1;
+      }
+  fill (map, length, 0, 6);
+  return check (map, length, 0, 6);
+}
+
 /* A page that lies wholly beyond the end of the file faults (SIGBUS).  */
 static int
 beyond_end_faults (void)
@@ -288,7 +373,11 @@ run (const char *description, int (*test) (void))
 
 static int cycles = 100;
 
+static int shrink_unlinked (void) { return shrink_and_regrow (0); }
+static int shrink_linked (void) { return shrink_and_regrow (1); }
 static int many_cycles (void) { return repeated_cycles (cycles); }
+static int msync_file (void) { return msync_keeps_data (1); }
+static int msync_anonymous (void) { return msync_keeps_data (0); }
 
 static const struct
 {
@@ -301,6 +390,12 @@ static const struct
   { "data survives unmapping and mapping again", unmap_and_remap },
   { "a page beyond the end of the file faults", beyond_end_faults },
   { "repeated cycles work and give the space back", many_cycles },
+  { "shrink and regrow an unlinked file: zeros past the cut",
+    shrink_unlinked },
+  { "shrink and regrow a linked mapped file: zeros past the cut",
+    shrink_linked },
+  { "msync keeps the data of a mapped file", msync_file },
+  { "msync keeps the data of anonymous shared memory", msync_anonymous },
 };
 
 int

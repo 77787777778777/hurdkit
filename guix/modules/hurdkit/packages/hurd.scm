@@ -70,3 +70,32 @@
         (append (origin-patches (package-source hurd-hurdkit))
                 (list (hurdkit-patch "hurd-tmpfs-keep-mapped.patch"))))))
     (synopsis "The Hurd with mappings of unlinked tmpfs files kept")))
+
+;; Shared memory on a tmpfs also needs the default pager and GNU Mach to
+;; keep its pages: when a file is truncated in the middle of a page, and
+;; on msync.
+(define-public hurd-shm
+  (package
+    (inherit hurd-tmpfs-mapped)
+    (name "hurd-shm")
+    (source
+     (origin
+       (inherit (package-source hurd-tmpfs-mapped))
+       (patches
+        (append (origin-patches (package-source hurd-tmpfs-mapped))
+                (list (hurdkit-patch "hurd-defpager-truncate-copy.patch"))))))
+    (synopsis "The Hurd with the fixes for shared memory on a tmpfs")))
+
+(define-public gnumach-shm
+  (package
+    (inherit gnumach-hurdkit)
+    (name "gnumach-shm")
+    (source
+     (origin
+       (inherit (package-source gnumach-hurdkit))
+       (patches
+        (append (origin-patches (package-source gnumach-hurdkit))
+                (map hurdkit-patch
+                     '("gnumach-copyin-laundry-pages.patch"
+                       "gnumach-object-sync-default-pager.patch"))))))
+    (synopsis "GNU Mach with the fixes for the default pager's objects")))
