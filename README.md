@@ -55,6 +55,9 @@ The 3p source checkouts (`mig`, `gnumach`, `glibc`, `hurd`, `9pfs`, `libpciacces
 | `make guix-repair` / `make guix-reset-state` | Repair / delete the kept Guix state |
 | `make guix-authorize-host` | Authorize the host signing key for Guix archive transfers |
 | `make guix-virtio-test` | Run the virtio-9p/9pfs matrix in a disposable Guix guest |
+| `make linux-ref-image` / `make linux-ref-start` | Build / boot the Linux niri reference (port 2224) |
+| `make linux-ref-stop` / `make linux-ref-screenshot` | Stop it / capture the niri output as PPM |
+| `make stage0-harness-check` / `make stage0-check` | Test graphics tools / run the stage-0 live GPU gate |
 | `make toolchain` | Build the x86_64-gnu cross toolchain |
 | `make toolchain-docker` | Same via Docker |
 | `make fetch-3p` | Clone missing 3p source checkouts |

@@ -33,6 +33,10 @@
             e2fsprogs # debugfs, e2fsck, dumpe2fs
             libnbd # nbdfuse, for the offline repair of a qcow2 image
             openssh # ssh, scp, ssh-keygen
+            socat # Unix-socket transport for scripts/qmp.tcl
+            tcl # Tcl tools and tcllib's JSON support
+            tclPackages.tcllib
+            gcc # tests/fake_qmp.c fixture compiler
             (python3.withPackages (ps: [ ps.pexpect ])) # scripts/provision_guest.py
             git
             gawk
@@ -40,6 +44,7 @@
             gnugrep
             coreutils
             file
+            imagemagick # niri PNG -> PPM for accelerated guest screenshots
             which
 
             # --- cross toolchain (make toolchain) ---
