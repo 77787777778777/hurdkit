@@ -208,6 +208,7 @@ glibc: gnumach mig hurd-headers
 	else \
 	    rm -rf $(BUILD)/glibc && mkdir -p $(BUILD)/glibc && cd $(BUILD)/glibc && \
 	    PATH=$(PREFIX)/bin:$$PATH \
+	    CC=$(PREFIX)/bin/x86_64-gnu-gcc \
 	    CXX=false \
 	    CPPFLAGS="-idirafter $(REPO_ROOT)/3p/hurd -idirafter $(PREFIX)/include -DUNIXOID_TRAPS=0" \
 	    CPATH=$(PREFIX)/include \
