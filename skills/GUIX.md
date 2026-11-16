@@ -12,6 +12,8 @@ Use this skill for work on the Guix guest (`guix/`, `guix.mk`,
 - `guix/hurd64.scm`: the system declaration of the guest.
 - `guix/goonix.scm`: goonix as the guest's own Guix (same commit as the lock).
 - `guix.mk`: the make targets of the guest.
+- `scripts/guix_vm.sh`: builds, boots and manages the guest.
+- `img/guix/`: the base image, overlays and logs of the guest.
 - `img/keys/`: the SSH keys of the guest's root and peon accounts.
 
 ## Goal
@@ -102,6 +104,48 @@ without `/run/wrappers/bin` in `PATH`, add
 `GUIX_SUDO=/run/wrappers/bin/sudo`. An image built before the key existed
 does not trust it: rebuild the image.
 
+### Boot and manage the guest
+
+```sh
+make guix-image guix-start    # build, then boot and wait for SSH
+make guix-ssh                 # a root shell; guix-ssh-peon for peon
+make guix-stop
+```
+
+`make guix-image` builds the image as above, converts it into
+`img/guix/hurd64.base.qcow2` and creates the accounts' SSH keys in
+`img/keys/` when they are missing; a second run reports that it is up to
+date. It refuses a `guix` whose first `--version` line lacks `goonix`
+(`GUIX_ANY_VERSION=1` overrides that for experiments).
+
+`make guix-start` boots a disposable overlay of the base image, waits for a
+successful SSH login on the host port `GUIX_SSH_PORT`, and boots again when
+a boot does not answer in time (G15). `make guix-status` says whether the
+guest runs and answers. `make guix-stop` sends `halt` over SSH, waits for
+GNU Mach's shutdown marker in the serial log, then stops QEMU, because a
+Hurd halt does not power the machine off (G16). A forced stop without that
+marker returns failure. The variables at the top of `guix.mk` and of
+`scripts/guix_vm.sh` say what can be set, with their defaults.
+
+### Rebuild and persistent state
+
+Change the declaration, then `make guix-stop guix-image guix-start`.
+
+`make guix-start-persist` keeps the disk in `img/guix/state.qcow2`, an
+overlay of the current base image (G8). After an unclean stop, run
+`make guix-repair`: it checks the root filesystem of the kept state with
+`e2fsck`, and what the guest had not written yet is lost (`sync` does not
+wait on the Hurd). `make guix-reset-state` deletes the kept state; `make
+guix-image` refuses to replace the base while one exists.
+
+### When a guest does not answer
+
+Read `img/guix/serial-N.log` (`.serial-current` names the active boot;
+`serial.log` keeps the last one after stop) and save the screen with
+`make guix-screenshot` (`img/guix/screen.ppm`). `bash scripts/guix_vm.sh
+monitor 'info pci'` talks to the QEMU monitor. A boot that times out gets a
+fresh overlay; a kept state is repaired before the next attempt.
+
 ## Pitfalls
 
 **G1. An image built by another Guix is a different system.** Another
@@ -137,9 +181,22 @@ exactly like a guest that is still booting.
 **G6. The 64-bit guest needs `-M q35`.** The default machine type gives the
 64-bit Hurd memory problems.
 
+**G8. A kept state is tied to one base image.** `img/guix/state.qcow2`
+stores only the blocks that differ from the base. On a new base it
+describes a disk that no longer exists and the guest sees a corrupt
+filesystem. Copy what you need out with `scp`, then `make guix-reset-state`.
+
 **G9. Nix only sees files that git knows.** After editing `nix/flake.nix`,
 `git add` it before `nix develop`. (Guix reads `guix/` from the working
 directory, so this does not apply there.)
+
+**G10. The store image is read-only and compressed.** `guix_vm.sh image`
+keeps it from the garbage collector with `--root=` (the link
+`img/guix/hurd64.store-image`) and converts it into the base image. Never
+boot the store file without `-snapshot`.
+
+**G11. The guest has little free disk space.** The image is sized to its
+content. Set `GUIX_IMAGE_OPTS=--image-size=8G` when you need room.
 
 **G13. Parallel heavy jobs make everything look hung.** Building goonix or
 an image while a guest runs saturates the disk, and `nix develop` waits
@@ -149,8 +206,30 @@ silently on a store lock. Run heavy steps one after another; `cat
 **G14. An open port is not a ready guest.** QEMU accepts the forwarded port
 at once. Only a successful login proves the guest is up.
 
+**G15. The guest sometimes hangs at boot, in the network setup.** Such a
+boot sits idle after `Service file-systems has been started.`; sshd never
+starts and SSH fails with `Connection timed out during banner exchange`. A
+good boot prints `irq handler [11]: new delivery port … for
+/hurd/netdde(…)` right after that line (netdde, the network card driver,
+starting when `pfinet` opens `eth0`); a hung boot never does. The cause is
+not known. `guix_vm.sh start` stops a boot without SSH after
+`GUIX_BOOT_TIMEOUT` seconds and tries again, `GUIX_BOOT_ATTEMPTS` times in
+all.
+
+**G16. `halt` does not power the virtual machine off.** GNU Mach prints
+`Shutdown completed successfully, now in tight loop.` on its console, which
+the declaration puts on the serial line (`console=com0`), and QEMU keeps
+running. `guix_vm.sh stop` waits for that line, then stops QEMU.
+
 **G17. Ignore "Consider running 'guix pull'".** goonix has no channel
 information, so `guix` prints it every time. See G1.
+
+**G18. `guix system image --root=LINK` does not replace a link.** It fails
+with `failed to create GC root`, so `guix_vm.sh image` removes the old link
+first. A link renamed after the build no longer protects the image.
+
+**G19. A Unix socket path has at most 107 bytes.** The sockets that talk
+to QEMU therefore live in `$XDG_RUNTIME_DIR`, named after the SSH port.
 
 ## Verification
 
@@ -160,3 +239,4 @@ when its checks pass and prints what failed otherwise.
 | Check | Command |
 |---|---|
 | Scripts and declarations (boots nothing) | `make guix-test` |
+| The guest boots, answers and halts | `make guix-image guix-start guix-ssh-peon guix-stop` |
