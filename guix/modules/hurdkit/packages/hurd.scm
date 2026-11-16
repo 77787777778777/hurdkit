@@ -56,3 +56,17 @@
        ;; rule to make target 'auth_requestUser.stamp'".
        ((#:parallel-build? _ #t) #f)))
     (synopsis "The Hurd at a newer, pinned commit")))
+
+;; tmpfs keeps the mappings of an unlinked file working after its last
+;; close, as shared memory (shm_open, Wayland buffers) needs.
+(define-public hurd-tmpfs-mapped
+  (package
+    (inherit hurd-hurdkit)
+    (name "hurd-tmpfs-mapped")
+    (source
+     (origin
+       (inherit (package-source hurd-hurdkit))
+       (patches
+        (append (origin-patches (package-source hurd-hurdkit))
+                (list (hurdkit-patch "hurd-tmpfs-keep-mapped.patch"))))))
+    (synopsis "The Hurd with mappings of unlinked tmpfs files kept")))

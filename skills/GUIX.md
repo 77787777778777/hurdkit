@@ -166,6 +166,19 @@ whose services otherwise keep starting goonix's default Hurd. In such a
 guest, `ps -ef` shows every translator from the one Hurd.
 `guix/hurd64-hurdkit.scm` is the guest with both.
 
+### niri platform guest
+
+`make stage1-check` builds `guix/hurd64-platform.scm` into
+`img/guix-platform/`, boots it on its own port and runs the platform's test
+programs in it; `scripts/stage1_check.sh` lists them. The guest has:
+
+- `hurd-tmpfs-mapped`, which is `hurd-hurdkit` with
+  `guix/patches/hurd-tmpfs-keep-mapped.patch`: when the last reference to
+  an unlinked file goes away, tmpfs no longer shrinks its memory object to
+  zero, so the file's mappings keep working. `tmpfs-shm DIRECTORY`
+  (`tests/hurd/tmpfs-shm.c`) checks it on `/dev/shm`, and on ext2 as the
+  control; it also runs on Linux.
+
 ## Pitfalls
 
 **G1. An image built by another Guix is a different system.** Another
@@ -251,6 +264,17 @@ first. A link renamed after the build no longer protects the image.
 **G19. A Unix socket path has at most 107 bytes.** The sockets that talk
 to QEMU therefore live in `$XDG_RUNTIME_DIR`, named after the SSH port.
 
+**G22. The guest has no swap.** Pages that GNU Mach evicts under memory
+pressure go to the default pager, which has nowhere to write them: the
+serial log shows `(default pager): data_return write error, losing data`,
+and every later page-in of that memory object fails (SIGBUS). The same two
+lines after a tmpfs file is deleted are harmless: the kernel returns the
+dirty pages of an object that is going away. Two operations lose shared
+memory without any memory pressure: `msync` on a tmpfs file or on anonymous
+shared memory, and truncating a tmpfs file in the middle of a resident
+page, which stops GNU Mach in its debugger (`vm_map_copyin_page_list:
+Assertion 'm->wire_count == 1'`).
+
 **G23. The newer Hurd's `make -j` is racy.** `utils/` fails with `No rule to
 make target 'auth_requestUser.stamp'`, often enough that `hurd-hurdkit`
 builds serially.
@@ -265,3 +289,4 @@ when its checks pass and prints what failed otherwise.
 | Scripts and declarations (boots nothing) | `make guix-test` |
 | The guest boots, answers and halts | `make guix-image guix-start guix-ssh-peon guix-stop` |
 | The guest with Hurdkit's GNU Mach and Hurd | `GUIX_DIR=$PWD/img/guix-hurdkit GUIX_SSH_PORT=2225 GUIX_OS=$PWD/guix/hurd64-hurdkit.scm bash scripts/guix_vm.sh image`, then `start`, `ssh root ps -ef` and `stop` the same way |
+| The platform guest's tests | `make stage1-check` |
