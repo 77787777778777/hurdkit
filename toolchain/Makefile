@@ -17,7 +17,7 @@ BACKEND   ?= hostlocal
 BINUTILS_VER := 2.46.1
 GCC_VER      := 15.3.0
 
-.PHONY: all toolchain toolchain-clean fetch binutils gcc1 gnumach gnumach-kernel glibc gcc2 mig hurd hurd-headers libpciaccess libtrivfs libirqhelp virtio-9p virtio-balloon 9pfs verify-vm clean tooldir 3p-pin glibc-rebuild
+.PHONY: all toolchain toolchain-clean fetch binutils gcc1 gnumach gnumach-kernel glibc gcc2 mig hurd hurd-headers libpciaccess libtrivfs libirqhelp virtio-9p virtio-balloon virtio-blk 9pfs verify-vm clean tooldir 3p-pin glibc-rebuild
 
 # The verified 3p checkouts, pinned to exact SHAs (see
 # stuff/crosscompile_plan.md, "3p source pins"). The shared 3p checkout is
@@ -458,6 +458,19 @@ virtio-balloon: hurd libpciaccess libirqhelp
 	    LIBS="shouldbeinlibc ihash ports iohelp fshelp trivfs pciaccess hurduser machuser irqhelp"
 	@echo "=== gate: virtio-balloon ==="
 	file $(VIRTIO_DIR)/virtio-balloon
+
+# Same build and gate shape as virtio-balloon: the repo Makefile's
+# default target already builds the blk driver, so this only names the
+# binary the disk harness installs.
+virtio-blk: hurd libpciaccess libirqhelp
+	$(MAKE) -C $(VIRTIO_DIR) clean
+	$(MAKE) -C $(VIRTIO_DIR) \
+	    PATH=$(PREFIX)/bin:$$PATH \
+	    CC=$(PREFIX)/bin/x86_64-gnu-gcc \
+	    CPATH=$(PREFIX)/include \
+	    LIBS="shouldbeinlibc ihash ports iohelp fshelp trivfs pciaccess hurduser machuser irqhelp"
+	@echo "=== gate: virtio-blk ==="
+	file $(VIRTIO_DIR)/virtio-blk
 
 verify-vm: 9pfs
 	@echo "=== V2: ELF check ==="

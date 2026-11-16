@@ -2,14 +2,18 @@
 # Boot the Hurd guest with a host directory shared through QEMU's virtio-9p
 # device and run the translator test matrix (scripts/virtio_test.py).
 #
-# The guest boots from a throw-away overlay of the base image, so the base
-# stays pristine. The same overlay is reused for the no-device negative test
-# at the end, which is why the translators installed into it survive the
-# first poweroff.
+# The guest boots from a throw-away overlay of the staged image, so the
+# image stays pristine. The same overlay is reused for the no-device
+# negative test at the end, which is why the translators installed into it
+# survive the first poweroff.
 #
 # On failure QEMU is left running and the serial log is kept, so the guest
 # can be inspected by hand (see the printed SSH command; GDB=1 makes the
 # driver attach gdb to the stuck translators first).
+#
+# The boot scaffolding (overlay, pidfile discipline, SSH probe, monitor
+# socket, poweroff wait) lives in scripts/virtio_boot_lib.sh, shared with
+# the other virtio harnesses.
 #
 # Environment:
 #   SHARE     host directory to share (default img/share)
@@ -22,6 +26,7 @@
 #             SSH_PORT instead of booting a fresh overlay (the state left
 #             behind by a failed run, for inspection and re-runs); the
 #             no-device negative test is skipped in this mode
+#   MODE      which matrix to run: main (default), nodev or stress
 #   VIRTIO_ADDR / E1000_ADDR
 #             PCI slot of the virtio-9p / e1000 device.  At the default
 #             slots both land on IRQ 11, and gnumach intermittently
@@ -37,13 +42,13 @@
 #             with the default in-kernel irqchip the guest IOAPIC is
 #             emulated by KVM and QEMU sees none of its traffic.
 #   QEMU_EXTRA
-#             Extra command-line arguments passed to boot_qemu's QEMU
-#             invocation (e.g. -machine kernel_irqchip=split).
+#             Extra command-line arguments passed to QEMU
+#             (e.g. -machine kernel_irqchip=split).
 #   SSH_PROBE_ATTEMPTS
 #             Boot patience: number of 2-5 s SSH probes before the boot
 #             is declared timed out (default 120; split-irqchip boots
 #             need several hundred).
-#   BASE_IMG  Base image for the overlay (default img/hurd.base.qcow2).
+#   BASE_IMG  Base image for the overlay (default img/hurd.packages.qcow2).
 
 set -euo pipefail
 
@@ -59,8 +64,6 @@ SHARE="${SHARE:-${REPO_ROOT}/img/share}"
 MOUNT_TAG="${MOUNT_TAG:-hostshare}"
 SSH_PORT="${SSH_PORT:-2222}"
 SSH_HOST="${SSH_HOST:-127.0.0.1}"
-# Which matrix to run in the guest: main (default), nodev or stress
-# (scripts/virtio_test.py documents each).
 MODE="${MODE:-main}"
 # Keep virtio-9p off the e1000's IRQ line by default (see VIRTIO_ADDR
 # above).  An empty override restores the shared-line configuration.
@@ -85,161 +88,48 @@ printf 'from host\n' > "$SHARE/host-seed.txt"
 
 TMP_DIR="${REPO_ROOT}/img/tmp"
 mkdir -p "$TMP_DIR"
-OVERLAY=""
-QEMU_LOG="${TMP_DIR}/virtio-test-qemu.log"
-QEMU_PID=""
 FAILED=0
 REUSE="${REUSE:-0}"
-PIDFILE="${TMP_DIR}/virtio-test-qemu.pid"
 
-# One test guest at a time: a previous run's QEMU would collide on the
-# forwarded port, and the collision otherwise surfaces as a confusing
-# login failure minutes into the next run.  The pidfile names the owner,
-# so leftover sessions are detected instead of guessed at with pgrep.
-if [[ -f "$PIDFILE" ]]; then
-    OLD_PID="$(cat "$PIDFILE" 2>/dev/null || true)"
-    if [[ -n "$OLD_PID" ]] && kill -0 "$OLD_PID" 2>/dev/null \
-        && grep -q qemu-system "/proc/$OLD_PID/comm" 2>/dev/null; then
-        if [[ "$REUSE" != "1" ]]; then
-            echo "virtio-test: previous test QEMU (pid $OLD_PID) still running;" >&2
-            echo "  rerun with REUSE=1 to use it, or /bin/kill -9 $OLD_PID first" >&2
-            exit 1
-        fi
-        # REUSE keeps the pidfile: it still identifies the live guest.
-    else
-        rm -f "$PIDFILE"
-    fi
-fi
+VT_NAME="virtio-test"
+VT_TMP_DIR="$TMP_DIR"
+VT_QEMU_LOG="${TMP_DIR}/virtio-test-qemu.log"
+VT_PIDFILE="${TMP_DIR}/virtio-test-qemu.pid"
+VT_SSH_HOST="$SSH_HOST"
+VT_SSH_PORT="$SSH_PORT"
+VT_SSH_KEY="$SSH_KEY"
+VT_BASE_IMG="$BASE_IMG"
+VT_E1000_ADDR="$E1000_ADDR"
+VT_TRACE="v9fs_*"
+VT_QTRACE="${QTRACE:-}"
+VT_QEMU_EXTRA="${QEMU_EXTRA:-}"
+VT_RERUN_HINT="rerun the matrix against it with: REUSE=1 make virtio-test"
+source "$SCRIPT_DIR/virtio_boot_lib.sh"
 
-cleanup() {
-    if [[ "$FAILED" -eq 1 ]]; then
-        if [[ -n "$QEMU_PID" ]]; then
-            echo "virtio-test: FAILED; QEMU left running (pid $QEMU_PID), "
-        else
-            echo "virtio-test: FAILED; the reused guest is still running"
-        fi
-        echo "  serial log: $QEMU_LOG"
-        echo "  inspect with: ssh -i $SSH_KEY -p $SSH_PORT root@$SSH_HOST"
-        echo "  rerun the matrix against it with: REUSE=1 make virtio-test"
-        exit 1
-    fi
-    if [[ -n "$QEMU_PID" ]] && kill -0 "$QEMU_PID" 2>/dev/null; then
-        kill "$QEMU_PID" 2>/dev/null || true
-        wait "$QEMU_PID" 2>/dev/null || true
-    fi
-    if [[ -n "$OVERLAY" ]]; then
-        rm -f "$OVERLAY"
-    fi
-    if [[ "$REUSE" != "1" ]]; then
-        rm -f "$PIDFILE"
-    fi
-}
-trap cleanup EXIT
-
-boot_qemu() {
-    # The extra arguments are the fsdev/device pair; the no-device boot
-    # passes none, which is the negative test's whole point. The v9fs_*
-    # trace events show whether the device model ever sees a request, which
-    # separates driver bugs from front-end bugs.
-    : > "$QEMU_LOG"
-    # Monitor socket: lets a wedged run be dissected live (info pic/ioapic,
-    # registers, guest-physical memory) without SSH or QEMU symbols.
-    MONITOR_SOCK="$(dirname "$QEMU_LOG")/virtio-test-monitor.sock"
-    rm -f "$MONITOR_SOCK"
-    qemu-system-x86_64 \
-        "${QEMU_ACCEL[@]}" \
-        -smp 4 \
-        -m 2G \
-        -drive file="$OVERLAY",if=ide,cache=writeback \
-        -netdev user,id=net0,hostfwd=tcp:"$SSH_HOST":"$SSH_PORT"-:22 \
-        -device e1000,netdev=net0${E1000_ADDR:+,addr="$E1000_ADDR"} \
-        -trace enable='v9fs_*' \
-        ${QTRACE:+-trace enable="$QTRACE" -D "$TMP_DIR/qtrace.log"} \
-        ${QEMU_EXTRA:+$QEMU_EXTRA} \
-        -monitor unix:"$MONITOR_SOCK",server,nowait \
-        "$@" \
-        -nographic > "$QEMU_LOG" 2>&1 &
-    QEMU_PID=$!
-    echo "$QEMU_PID" > "$PIDFILE"
-
-    # With SSH_PORT=0 QEMU binds an ephemeral port; discover which one it
-    # got so the SSH probe below and scripts/virtio_test.py can connect.
-    if [[ "$SSH_PORT" == "0" || "$SSH_PORT" == "auto" ]]; then
-        SSH_PORT=$(ss -ltnp 2>/dev/null | awk -v pid="$QEMU_PID" '
-            $0 ~ "pid=" pid "," { n = split($4, a, ":"); print a[n]; exit }')
-        if [[ -z "$SSH_PORT" ]]; then
-            echo "virtio-test: could not discover the forwarded SSH port" >&2
-            return 1
-        fi
-        export SSH_PORT
-        echo "virtio-test: QEMU picked SSH port $SSH_PORT"
-    fi
-
-    # Probe with a real SSH login: QEMU binds the hostfwd port long before
-    # the guest's sshd answers, so a TCP connect alone reports success
-    # while the login would still race and die on a reset.
-    for _ in $(seq 1 "${SSH_PROBE_ATTEMPTS:-120}"); do
-        if ssh -i "$SSH_KEY" -p "$SSH_PORT" -o StrictHostKeyChecking=no \
-            -o UserKnownHostsFile=/dev/null -o BatchMode=yes \
-            -o LogLevel=ERROR -o ConnectTimeout=3 \
-            root@"$SSH_HOST" true 2>/dev/null; then
-            return 0
-        fi
-        if ! kill -0 "$QEMU_PID" 2>/dev/null; then
-            echo "virtio-test: QEMU exited during boot" >&2
-            cat "$QEMU_LOG" >&2
-            return 1
-        fi
-        sleep 2
-    done
-    echo "virtio-test: timed out waiting for SSH on port $SSH_PORT" >&2
-    cat "$QEMU_LOG" >&2
-    return 1
-}
-
-wait_poweroff() {
-    for _ in $(seq 1 60); do
-        if ! kill -0 "$QEMU_PID" 2>/dev/null; then
-            wait "$QEMU_PID" 2>/dev/null || true
-            QEMU_PID=""
-            return 0
-        fi
-        sleep 5
-    done
-    echo "virtio-test: the guest did not power off, terminating QEMU" >&2
-    kill "$QEMU_PID" 2>/dev/null || true
-    return 1
-}
-
-export SSH_HOST SSH_PORT SSH_KEY VIRTIO_9P_BIN P9FS_BIN SHARE MOUNT_TAG
-export QEMU_LOG GDB="${GDB:-0}"
+vt_check_pidfile "$REUSE"
+trap 'vt_cleanup "$FAILED" "$REUSE"' EXIT
 
 echo "virtio-test: booting with the virtio-9p device (tag $MOUNT_TAG)..."
 if [[ "$REUSE" == "1" ]]; then
-    if ! ssh -i "$SSH_KEY" -p "$SSH_PORT" -o StrictHostKeyChecking=no \
-        -o UserKnownHostsFile=/dev/null -o BatchMode=yes -o LogLevel=ERROR \
-        -o ConnectTimeout=5 root@"$SSH_HOST" true 2>/dev/null; then
-        echo "virtio-test: REUSE=1 but no guest answers on port $SSH_PORT" >&2
+    if ! vt_ssh_alive; then
+        echo "virtio-test: REUSE=1 but no guest answers on port $VT_SSH_PORT" >&2
         echo "  boot one first (without REUSE) or leave a failed run's QEMU running" >&2
         exit 1
     fi
-    echo "virtio-test: reusing the guest already running on port $SSH_PORT"
+    echo "virtio-test: reusing the guest already running on port $VT_SSH_PORT"
 else
-    OVERLAY="$(mktemp -u "$TMP_DIR/XXXXXX.qcow2")"
-    qemu-img create -f qcow2 -b "$(readlink -f "$BASE_IMG")" -F qcow2 \
-        "$OVERLAY" >/dev/null
-
-    QEMU_ACCEL=()
-    if [[ -r /dev/kvm && -w /dev/kvm ]]; then
-        QEMU_ACCEL=(-enable-kvm -cpu host)
-    else
-        QEMU_ACCEL=(-cpu max)
-    fi
-
-    boot_qemu \
+    vt_make_overlay
+    # The fsdev/device pair carries the share; the v9fs_* traces are
+    # enabled by the lib's family trace.  The no-device negative boot
+    # passes no device arguments at all.
+    vt_boot \
         -fsdev local,id=virtfs0,path="$SHARE",security_model=none \
-        -device virtio-9p-pci,fsdev=virtfs0,mount_tag="$MOUNT_TAG",disable-legacy=off${VIRTIO_ADDR:+,addr="$VIRTIO_ADDR"}
+        -device "virtio-9p-pci,fsdev=virtfs0,mount_tag=$MOUNT_TAG,disable-legacy=off${VIRTIO_ADDR:+,addr=$VIRTIO_ADDR}"
 fi
+SSH_PORT="$VT_SSH_PORT"
+
+export SSH_HOST SSH_PORT SSH_KEY VIRTIO_9P_BIN P9FS_BIN SHARE MOUNT_TAG
+export REUSE QEMU_LOG="$VT_QEMU_LOG" GDB="${GDB:-0}"
 
 python3 "$SCRIPT_DIR/virtio_test.py" "$MODE" || FAILED=1
 
@@ -262,17 +152,17 @@ if [[ "$MODE" == "main" ]]; then
     # The main matrix's python powers the guest off on success; wait for that
     # QEMU to exit and release the forwarded port before the no-device boot
     # binds the same port, or the new QEMU dies on the bind race.
-    if [[ -n "$QEMU_PID" ]]; then
-        wait_poweroff || FAILED=1
+    if [[ -n "$VT_QEMU_PID" ]]; then
+        vt_wait_poweroff || FAILED=1
     fi
     if [[ "$FAILED" -eq 1 ]]; then
         exit 1
     fi
 
     echo "virtio-test: rebooting without the device for the negative test..."
-    boot_qemu
+    vt_boot
     python3 "$SCRIPT_DIR/virtio_test.py" nodev || FAILED=1
 fi
 
-wait_poweroff
+vt_wait_poweroff
 echo "virtio-test: done."

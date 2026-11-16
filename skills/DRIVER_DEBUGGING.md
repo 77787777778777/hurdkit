@@ -49,7 +49,15 @@ including when the normal SSH control channel is already dead.
 - Kernel serial-log markers: `new delivery port ... for <task>` (registered),
   `release a dead delivery port` + `still N unacked irqs in entry` (a driver
   exited between fire and ack; the kernel compensates with one `__enable_irq`
-  per unacked). Benign in isolation; count them during churn.
+  per unacked). Benign in isolation; count them during churn. The
+  `new delivery port` lines double as a **process bring-up counter**: exactly
+  one per pid is the invariant, because `irqhelp_init` is once-per-process and
+  each `virtio_irq_install` registers one port. Two lines for one pid = the
+  process brought the device up twice, i.e. main fell through from a one-shot
+  mode into the daemon loop (see the virtio-blk lesson below). Reused-run logs
+  also contain NUL holes (the harness truncates the log while QEMU keeps its
+  fd and writes at the old offset): grep with `-a`, pipe through
+  `tr -d '\000'`, and remember grep line numbers include the hole.
 - The ISR read is read-to-clear: two handlers for the same virtio device (a
   selftest next to a live translator) steal each other's interrupt and one
   waiter times out. One owner per device at a time.
@@ -144,6 +152,38 @@ by mask=1 and no unmask write is the confirmation to capture.
   directories; do not rely on them being in git.
 - The driver's 30 s `ETIMEDOUT` prints `virtio-9p: device did not reply`; if
   a hung run never prints it, the hang is before the condvar wait, not in it.
+- When a bash boot script and the python core share an implicit contract
+  (REUSE=1 promises "guest left running"), move the contract into the
+  environment the core can read: the .sh exports REUSE and the shared
+  `finish()` skips its poweroff-on-success under REUSE=1. A silent violation
+  surfaces as the *next* REUSE run failing with "no guest answers on port".
+- Device-model evidence for blk datapath assertions comes from QEMU trace
+  events (`virtio_blk_handle_read`/`_write` with sector+nsectors,
+  `virtio_blk_rw_complete` with ret, `virtio_blk_req_complete` with status),
+  enabled via `VT_TRACE="virtio_blk*"`; the same pattern as the 9p
+  `v9fs_*` traces, grep the qemu log with `-a`.
+
+## One-shot modes in a daemon-default driver (virtio-blk harness lesson)
+
+A CLI binary whose default mode is a daemon (`virtio-blk`, and the planned
+shape of most drivers here) needs an explicit `return 0` from `main` after
+**every** one-shot mode (`--status`, `--selftest`, `--read-range`). A missing
+return falls through into the daemon loop: the process stays alive forever,
+its second bring-up shows as a second `new delivery port` line for the same
+pid, and any pipeline consuming its stdout (`--read-range | sha256sum`)
+blocks forever on EOF -- a harness timeout with no driver-side error and no
+`device did not reply`, because the driver is not stuck, it is *idling by
+design*. The give-away: the daemon's exit-stats line (`reads N (M bytes)...`)
+appearing in output of a run that was only supposed to do a one-shot read.
+When timing guest one-shots through a pipe, remember `cmd | sha256sum;
+echo $?` reports the *last* stage's rc -- a hung producer looks like a
+successful pipeline that simply never finishes; wrap in `time (...)` and
+treat tens of seconds for a 64 KiB read as the bug, not the digest.
+Note also that a harness session timeout (`Timed out after Ns`) does not
+kill the remote process; the stray exits later on its own (or on the guest
+side only if something signals it), so post-mortem IRQ-log timelines need
+the timeout moment marked before correlating with `release a dead delivery
+port` lines.
 
 ## Guest-visible process table gotchas (balloon harness lessons)
 

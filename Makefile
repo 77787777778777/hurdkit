@@ -82,7 +82,7 @@ RM            := rm -f
 LOCK          := flock
 LOCK_FILE     := $(IMG_DIR)/.build.lock
 
-.PHONY: all download check base accounts packages kernel provision stage run run-nokvm ssh ssh-peon clean distclean toolchain toolchain-clean toolchain-docker verify-vm hurd-build gnumach-kernel 9pfs fetch-3p
+.PHONY: all download check base accounts packages kernel provision stage run run-nokvm ssh ssh-peon clean distclean toolchain toolchain-clean toolchain-docker verify-vm hurd-build gnumach-kernel 9pfs fetch-3p virtio-blk virtio-blk-test
 
 # The default builds the whole image pipeline, with every intermediate
 # exposed as its own qcow2 (see the stage rules below).
@@ -299,6 +299,7 @@ gnumach-kernel: fetch-3p ; $(MAKE) -C toolchain gnumach-kernel
 9pfs: fetch-3p         ; $(MAKE) -C toolchain 9pfs
 virtio-9p: fetch-3p    ; $(MAKE) -C toolchain virtio-9p VIRTIO_DIR=$(VIRTIO_DIR)
 virtio-balloon: fetch-3p    ; $(MAKE) -C toolchain virtio-balloon VIRTIO_DIR=$(VIRTIO_DIR)
+virtio-blk: fetch-3p    ; $(MAKE) -C toolchain virtio-blk VIRTIO_DIR=$(VIRTIO_DIR)
 
 # Boot the guest with a host directory shared through QEMU's virtio-9p
 # device and run the translator test matrix: the device selftest, the
@@ -327,6 +328,18 @@ virtio-balloon-test: virtio-balloon $(TEST_IMG)
 		VIRTIO_DIR="$(VIRTIO_DIR)" MODE="$(MODE)" RAM_MB="$(RAM_MB)" \
 		BASE_IMG="$(abspath $(TEST_IMG))" \
 		bash scripts/virtio_balloon_test.sh
+# Boot the guest with QEMU's virtio-blk device backed by a disposable raw
+# disk image and run the disk matrix: the driver selftest (raw read/write/
+# flush plus the Mach semantics layer), two-sided data checks (guest reads
+# vs the host-seeded image, guest writes vs the image content afterwards),
+# trace-backed device-model evidence, and the no-device negative boot
+# (see scripts/virtio_blk_test.sh; plan stuff/virtio_disk_plan.md §7.3).
+virtio-blk-test: virtio-blk $(TEST_IMG)
+	$(MKDIR_P) $(TMP_DIR)
+	SSH_HOST="$(SSH_HOST)" SSH_PORT="$(SSH_PORT)" REUSE="$(REUSE)" \
+		VIRTIO_DIR="$(VIRTIO_DIR)" MODE="$(MODE)" \
+		BASE_IMG="$(abspath $(TEST_IMG))" \
+		bash scripts/virtio_blk_test.sh
 verify-vm: fetch-3p    ; $(MAKE) -C toolchain verify-vm
 
 # Remove temporary overlay images
