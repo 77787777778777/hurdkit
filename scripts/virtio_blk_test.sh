@@ -29,6 +29,9 @@
 #               ~/src/virtio; a workbranch overrides this)
 #   VIRTIO_BLK_BIN
 #               blk binary to install (default $VIRTIO_DIR/virtio-blk)
+#   VBLK_CLIENT_BIN
+#               direct Mach device RPC client to install (default
+#               $VIRTIO_DIR/vblk-client)
 #   SSH_HOST / SSH_PORT
 #               address QEMU forwards the guest SSH port to (default
 #               127.0.0.1 / 2222; "0" lets QEMU pick a free port)
@@ -63,6 +66,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 BASE_IMG="${BASE_IMG:-${REPO_ROOT}/img/hurd.packages.qcow2}"
 VIRTIO_DIR="${VIRTIO_DIR:-${HOME}/src/virtio}"
 VIRTIO_BLK_BIN="${VIRTIO_BLK_BIN:-${VIRTIO_DIR}/virtio-blk}"
+VBLK_CLIENT_BIN="${VBLK_CLIENT_BIN:-${VIRTIO_DIR}/vblk-client}"
 SSH_PORT="${SSH_PORT:-2222}"
 SSH_HOST="${SSH_HOST:-127.0.0.1}"
 MODE="${MODE:-main}"
@@ -74,7 +78,7 @@ DISK_MB="${DISK_MB:-64}"
 SSH_KEY_DIR="${SSH_KEY_DIR:-${REPO_ROOT}/img/keys}"
 SSH_KEY="${SSH_KEY_DIR}/root_ed25519"
 
-for f in "$BASE_IMG" "$SSH_KEY" "$VIRTIO_BLK_BIN"; do
+for f in "$BASE_IMG" "$SSH_KEY" "$VIRTIO_BLK_BIN" "$VBLK_CLIENT_BIN"; do
     if [[ ! -f "$f" ]]; then
         echo "virtio-blk-test: missing $f" >&2
         echo "  (for $BASE_IMG: make stage STAGE=packages VARIANT=img/hurd.packages.qcow2)" >&2
@@ -137,7 +141,8 @@ else
 fi
 SSH_PORT="$VT_SSH_PORT"
 
-export SSH_HOST SSH_PORT SSH_KEY VIRTIO_BLK_BIN QEMU_LOG="$VT_QEMU_LOG"
+export SSH_HOST SSH_PORT SSH_KEY VIRTIO_BLK_BIN VBLK_CLIENT_BIN
+export QEMU_LOG="$VT_QEMU_LOG"
 export TEST_DISK DISK_MB REUSE GDB="${GDB:-0}"
 
 python3 "$SCRIPT_DIR/virtio_blk_test.py" "$MODE" || FAILED=1

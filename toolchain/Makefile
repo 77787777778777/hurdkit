@@ -461,7 +461,9 @@ virtio-balloon: hurd libpciaccess libirqhelp
 
 # Same build and gate shape as virtio-balloon: the repo Makefile's
 # default target already builds the blk driver, so this only names the
-# binary the disk harness installs.
+# binaries the disk harness installs: virtio-blk (raw datapath +
+# Mach device translator) and vblk-client (the direct-RPC harness
+# client).
 virtio-blk: hurd libpciaccess libirqhelp
 	$(MAKE) -C $(VIRTIO_DIR) clean
 	$(MAKE) -C $(VIRTIO_DIR) \
@@ -471,6 +473,7 @@ virtio-blk: hurd libpciaccess libirqhelp
 	    LIBS="shouldbeinlibc ihash ports iohelp fshelp trivfs pciaccess hurduser machuser irqhelp"
 	@echo "=== gate: virtio-blk ==="
 	file $(VIRTIO_DIR)/virtio-blk
+	file $(VIRTIO_DIR)/vblk-client
 
 verify-vm: 9pfs
 	@echo "=== V2: ELF check ==="

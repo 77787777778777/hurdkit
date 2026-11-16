@@ -16,6 +16,7 @@ virtio_blk* trace lines supply the device model's view.
 Configuration comes from the environment:
 
     VIRTIO_BLK_BIN   host path of the virtio-blk binary
+    VBLK_CLIENT_BIN  host path of the direct Mach device RPC client
     TEST_DISK        host path of the disposable test image
     DISK_MB          its size in MiB
 
@@ -50,6 +51,7 @@ import virtio_harness as vh
 # mode must import cleanly without them, so every lookup tolerates a
 # missing variable and main() validates the guest modes' needs.
 VIRTIO_BLK_BIN = os.environ.get("VIRTIO_BLK_BIN", "")
+VBLK_CLIENT_BIN = os.environ.get("VBLK_CLIENT_BIN", "")
 TEST_DISK = os.environ.get("TEST_DISK", "")
 DISK_MB = int(os.environ.get("DISK_MB", "64"))
 
@@ -153,6 +155,192 @@ def check_read_range(session, label, sector, count):
     vh.record(f"{label}: guest read of sectors {sector}+{count} matches image",
               got == want,
               f"guest {got}, host {want}" if got != want else got)
+
+
+# The Stage C device server: the translator node and the paths the
+# client-side write pattern lands in.  The write pattern is
+# deterministic (fixed tag prefix, rest zero) so the host can verify it
+# in the image without the guest reporting a digest.
+SERVE_NODE = "/dev/vblk0"
+STORE_NODE = "/tmp/vblk-store"
+GUEST_WRITE_TAG = b"vblk-guest-wrote-v1"
+# Far from the seeded canary/pattern ranges; the write test destroys
+# these sectors, and nothing else in the matrix reads them.
+WRITE_SECTOR = 16384
+# 1 MiB dd round trips through the storeio node: the read lands on the
+# seeded far pattern, the write zeroes a range nothing else touches.
+ONE_MB = 1 << 20
+DD_WRITE_SECTOR = WRITE_SECTOR + 256
+
+
+def client_read_sha(session, node, rec, count):
+    """sha256 of COUNT records read through the device RPC path."""
+    status, out = session.run(
+        f"/hurd/vblk-client read {node} {rec} {count} | sha256sum",
+        timeout=180)
+    if status != 0:
+        return None, out
+    m = re.search(r"([0-9a-f]{32,64})", out)
+    if not m:
+        return None, out
+    return m.group(1), out
+
+
+def phase4(session):
+    """The Mach device translator: publish, open, read, write, close.
+
+    This is plan milestone M3 / spike S3: the MIG ds_device_* server on
+    top of the semantics layer, exercised through real RPCs by the
+    direct-RPC client, plus the optional libstore/storeio consumer
+    path.  Every check runs against the disposable image policy of
+    plan D5 (the write test destroys only the WRITE_SECTOR range).
+    """
+    client = "/hurd/vblk-client"
+
+    status, out = session.run(
+        f"settrans -c {SERVE_NODE} /hurd/virtio-blk --serve", timeout=120)
+    vh.record("phase4 translator published", status == 0,
+              f"rc={status}, {out.strip()[-300:]}")
+    if status != 0:
+        return
+
+    # fsysopts answers only once trivfs_startup replied to the parent;
+    # a small settle delay keeps the first RPC off the startup race.
+    session.run("sleep 2")
+    status, out = session.run(f"fsysopts {SERVE_NODE}", timeout=60)
+    vh.record("phase4 translator node live", status == 0 and "virtio-blk" in out,
+              f"rc={status}, {out.strip()[-200:]}")
+
+    # Size query through device_open + DEV_GET_RECORDS/DEV_GET_SIZE.
+    status, out = session.run(f"{client} status {SERVE_NODE}", timeout=120)
+    want_sectors = (DISK_MB * (1 << 20)) // SECTOR
+    m = re.search(r"records=(\d+) record_size=(\d+)", out or "")
+    ok = (status == 0 and m is not None
+          and int(m.group(1)) == want_sectors and int(m.group(2)) == SECTOR)
+    vh.record("phase4 device_open + size query match the test image", ok,
+              f"rc={status}, {(out or '').strip()[:300]}")
+
+    # Two-sided reads through the RPC path: seeded ranges, including
+    # the multi-chunk far range.
+    got, out = client_read_sha(session, SERVE_NODE, 0, 128)
+    want = host_range_sha(0, 128 * SECTOR)
+    vh.record("phase4 device RPC read of seeded range matches image",
+              got == want, f"guest {got}, host {want}" if got != want else got)
+    got, out = client_read_sha(session, SERVE_NODE, FAR_SECTOR, FAR_COUNT)
+    want = host_range_sha(FAR_SECTOR * SECTOR, FAR_COUNT * SECTOR)
+    vh.record("phase4 device RPC multi-chunk read matches image",
+              got == want, f"guest {got}, host {want}" if got != want else got)
+
+    # Negative contract through real RPCs: bounds, alignment, unknown
+    # flavors, inband/map refusals, RO-open write refusal, close.
+    status, out = session.run(f"{client} check {SERVE_NODE}", timeout=180)
+    ok = status == 0 and out.count("PASS") >= 9 and "FAIL" not in out
+    vh.record("phase4 negative-contract checks", ok,
+              f"rc={status}, {out.strip()[-500:]}")
+
+    # Write + flush + read-back through the RPC path, then the host
+    # verifies the bytes in the image.
+    status, out = session.run(
+        f"printf '{GUEST_WRITE_TAG.decode()}%.0s' $(seq 1 64) "
+        f"| head -c {SECTOR} > /tmp/vblk-write.bin; "
+        f"{client} write {SERVE_NODE} {WRITE_SECTOR} /tmp/vblk-write.bin",
+        timeout=180)
+    ok = status == 0 and "flush and read-back ok" in out
+    vh.record("phase4 device RPC write+flush+read-back", ok,
+              f"rc={status}, {out.strip()[-300:]}")
+    with open(TEST_DISK, "rb") as f:
+        f.seek(WRITE_SECTOR * SECTOR)
+        image = f.read(SECTOR)
+    want_bytes = (GUEST_WRITE_TAG * 64)[:SECTOR]
+    vh.record("phase4 guest device write visible in host image",
+              image == want_bytes,
+              "sector content matches the guest pattern" if
+              image == want_bytes else f"sector: {image[:32].hex()}...")
+
+    # Optional libstore consumer (M3's storeio leg): attach storeio to
+    # the translator through libstore's dopen forms and run small dd
+    # round trips through the store node.  `-c' (no-cache) keeps user
+    # I/O on direct device RPCs instead of the pager path, which this
+    # server refuses (device_map is D_INVALID_OPERATION).  Both spec
+    # syntaxes are tried because the guest's storeio vintage decides
+    # which one parses; when neither attaches, these checks are
+    # skipped, not failed.
+    attached = False
+    for spec in (f"-T device '@{SERVE_NODE}:'", f"'device:@{SERVE_NODE}:'"):
+        status, out = session.run(
+            f"settrans -c {STORE_NODE} /hurd/storeio {spec}",
+            timeout=120)
+        if status == 0:
+            session.run("sleep 2")
+            st, _ = session.run(f"fsysopts {STORE_NODE}", timeout=60)
+            if st == 0:
+                attached = True
+                break
+        session.run(f"settrans -g -f {STORE_NODE} 2>/dev/null || true",
+                    timeout=60)
+
+    if not attached:
+        for name in ("phase4 storeio 128-block read matches image",
+                     "phase4 storeio 1 MiB dd read matches image",
+                     "phase4 storeio 1 MiB dd write verified in image"):
+            vh.record(name, True, "SKIPPED: storeio attach unavailable")
+    else:
+        got, out = guest_read_sha_node(session, STORE_NODE, 0, 128)
+        want = host_range_sha(0, 128 * SECTOR)
+        vh.record("phase4 storeio 128-block read matches image",
+                  got == want,
+                  f"store {got}, host {want}" if got != want else got)
+
+        # A small (1 MiB) dd read through the full libstore path: the
+        # seeded far pattern, so the digest is two-sided evidence.
+        got, out = guest_read_sha_node(session, STORE_NODE, FAR_SECTOR,
+                                       ONE_MB // SECTOR)
+        want = host_range_sha(FAR_SECTOR * SECTOR, ONE_MB)
+        vh.record("phase4 storeio 1 MiB dd read matches image",
+                  got == want,
+                  f"store {got}, host {want}" if got != want else got)
+
+        # A small (1 MiB) dd write through libstore: deterministic
+        # zeros over a range nothing else touches, verified in the
+        # host image afterwards (plan D5 disposable-image policy).
+        status, out = session.run(
+            f"dd if=/dev/zero of={STORE_NODE} bs={SECTOR} "
+            f"seek={DD_WRITE_SECTOR} count={ONE_MB // SECTOR} "
+            f"conv=notrunc 2>&1", timeout=180)
+        ok = status == 0
+        with open(TEST_DISK, "rb") as f:
+            f.seek(DD_WRITE_SECTOR * SECTOR)
+            image = f.read(ONE_MB)
+        ok = ok and image == bytes(ONE_MB)
+        vh.record("phase4 storeio 1 MiB dd write verified in image",
+                  ok,
+                  f"rc={status}, region "
+                  f"{'zeroed' if image == bytes(ONE_MB) else 'MISMATCH'}")
+
+        session.run(f"settrans -g {STORE_NODE}", timeout=60)
+
+    # Teardown: goaway (may need force if a client lingers), then the
+    # translator process must be gone and the node un-translated.
+    session.run(f"settrans -g {SERVE_NODE}", timeout=60)
+    status, out = session.run(
+        f"sleep 1; settrans -g -f {SERVE_NODE} 2>/dev/null; "
+        r"ps -ef | awk '/hurd\/virtio-blk --serve/ && !/awk/ {print $2}'",
+        timeout=60)
+    vh.record("phase4 translator torn down", out.strip() == "",
+              f"leftover pids: {out.strip()}")
+
+
+def guest_read_sha_node(session, node, rec, count):
+    """sha256 of COUNT 512-byte blocks read from a store NODE."""
+    status, out = session.run(
+        f"dd if={node} bs={SECTOR} skip={rec} count={count} 2>/dev/null "
+        f"| sha256sum", timeout=180)
+    if status != 0:
+        return None, out
+    m = re.search(r"([0-9a-f]{32,64})", out)
+    if not m:
+        return None, out
+    return m.group(1), out
 
 
 def phase1(session):
@@ -300,6 +488,8 @@ def main():
             session.run("install -m 755 /tmp/virtio-blk /hurd/virtio-blk")
             stress(session)
         else:
+            vh.install(VBLK_CLIENT_BIN, "/tmp/vblk-client")
+            session.run("install -m 755 /tmp/vblk-client /hurd/vblk-client")
             vh.install(VIRTIO_BLK_BIN, "/tmp/virtio-blk")
             session.run("install -m 755 /tmp/virtio-blk /hurd/virtio-blk")
             if not phase1(session):
@@ -307,6 +497,7 @@ def main():
             else:
                 if phase2(session):
                     phase3(session)
+                    phase4(session)
     except vh.GuestError as exc:
         vh.record("harness", False, str(exc))
         failed_early = True

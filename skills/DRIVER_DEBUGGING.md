@@ -199,6 +199,48 @@ a blank line). A harness that detects or kills daemons must use `ps -ef` (or
 during bring-up") when the daemons were in fact alive and accumulating as
 strays; clean strays with `kill -TERM <pid>` before re-running.
 
+## Translator stderr under settrans-detached (virtio-blk Stage C lesson)
+
+A translator's stderr does **not** reach the QEMU serial log when started
+via `settrans -c` detached. The harness saw `virtio-blk --serve` publish
+and answer RPCs, but nothing from its init or handler paths appeared in
+the serial log. Capture it with a wrapper script passed to settrans:
+
+    #!/bin/sh
+    exec /hurd/virtio-blk --serve -v 2>>/tmp/serve.log
+
+This exposed the per-request server trace (`demux id`, `open`, `read
+recnum ...`) and made the difference between "client-side EIO" and
+"server-side silence" visible.
+
+## Storeio --no-cache byte-to-block sign error (virtio-blk Stage C lesson)
+
+The first storeio read through a translator succeeded; every subsequent
+read failed instantly with EIO without reaching the server. Root cause:
+`hurd/storeio/dev.c` converted file offsets to device blocks with
+`offs << log2_block_size` (multiplying) instead of `offs >> log2_block_size`
+(dividing) in the `--no-cache` direct read/write paths. Block 0 worked by
+accident (`0 << n == 0 >> n == 0`); block N landed `N * block_size` sectors
+past the device end, which `libstore/device.c` mapped to `D_INVALID_RECNUM`
+→ `dev_error` → `EIO`. Every other offset conversion in `dev.c` used `>>`;
+this was a lone sign error in the no-cache fast paths (read line 484,
+write line 388). Fix committed on 3p/hurd branch
+`fix/storeio-no-cache-block-shift`. The harness now omits `-c` from the
+storeio spec so the buffered path (which divides correctly) is exercised.
+
+## mig defs file argument (virtio-blk Stage C lesson)
+
+`mig` needs the `.defs` file passed as an argument, not via stdin redirect:
+a redirect silently produces no output. Use `mig ... X.sdefsi` (file as
+argument), not `mig ... < X.sdefsi`.
+
+## Dual-translator ISR stealing (virtio-blk Stage C lesson)
+
+Two translators serving the same virtio-blk device steal each other's
+read-to-clear ISR; one waiter always times out. A 30 s "timeout" observed
+during early Stage C testing was this, not a server bug — one translator
+per device at a time.
+
 ## Reuse-mode vCPU livelock (open issue)
 
 Repeatedly booting the balloon harness against the same live guest
