@@ -4,7 +4,8 @@
 
 Use this skill whenever work touches the Hurd disk image or its boot path:
 
-- building or refreshing `img/hurd.base.qcow2` (`make base`, `make provision`),
+- building or refreshing `img/hurd.base.qcow2` (`make base`) or the staged
+  images on top of it (`make accounts`, `make packages`, `make kernel`),
 - changing what the guest does at first boot (GRUB, serial console, sshd, passwords),
 - changing what the in-VM provisioning step installs or configures,
 - debugging a guest that does not boot, does not answer on SSH, or whose
@@ -19,6 +20,8 @@ Use this skill whenever work touches the Hurd disk image or its boot path:
   (sourced by the preparation and the repair script).
 - `scripts/provision_base.sh` - boots the guest and runs the provisioning.
 - `scripts/provision_guest.py` - drives the guest over SSH (login, commands, poweroff).
+- `scripts/provision_stage.sh` - applies one provisioning stage to an image
+  and writes a new image layered on top of it (staged variants).
 - `scripts/repair_filesystem.sh` - offline ext2 repair of the provisioned image.
 - `img/keys/` - the SSH keys of the guest accounts (private keys, not in git).
 - `img/debian-hurd-amd64-<VERSION>.img.tar.xz` - the downloaded Debian GNU/Hurd image
@@ -31,18 +34,25 @@ without root privileges, and that boots the guest from a throw-away overlay so
 the base image stays byte-for-byte pristine:
 
 ```
-download -> offline preparation -> qcow2 base -> in-VM provisioning -> overlay boot
+download -> offline preparation -> qcow2 base -> staged images -> overlay boot
 ```
+
+"Base" is the raw, offline-prepared OS image: no accounts, no SSH keys, no
+guest packages. Every provisioning step lands in its own staged image
+(`accounts` -> `packages` -> `kernel`), so the intermediates stay visible and
+rebuilding the base propagates through the chain instead of being folded into
+one image. The test harnesses snapshot the `packages` stage.
 
 The acceptance criteria for a finished image are:
 
 1. `make base` produces `img/hurd.base.qcow2` whose root filesystem passes
    `e2fsck -fn` (exit status 0).
-2. `make provision` completes and leaves the same property (see "Known issue:
-   ext2 without a journal" for why a repair step is needed).
+2. `make accounts` and `make packages` complete and leave the same property
+   (see "Known issue: ext2 without a journal" for why a repair step is needed).
 3. `make run` boots the guest, SSH login as `root` with the configured password
    works, and the MD5 of `img/hurd.base.qcow2` is unchanged after the run.
-4. `make provision` a second time is a no-op ("Image is already provisioned.").
+4. The stage targets are idempotent: a second `make packages` is a no-op while
+   the stage image is newer than its input and the scripts.
 
 ## Environment (this sandbox)
 
@@ -148,10 +158,31 @@ image to qcow2 (`qemu-img convert -f raw -O qcow2`) and moves the result into
 place with `mv -f`. The build therefore never leaves a half-written base image
 behind, and two concurrent builds cannot interleave.
 
-### Stage 4 - in-VM provisioning (`scripts/provision_base.sh`)
+### Stage 4 - staged provisioning (`make accounts`, `make packages`)
+
+The pipeline provisions through stages, each of which is its own qcow2
+layered on the previous one. `scripts/provision_stage.sh <stage> <input>
+<variant> [ssh_port]` boots the input image in a throwaway overlay, applies
+the stage with `scripts/provision_guest.py`, repairs the filesystem offline
+and promotes the overlay to the variant image:
+
+```
+img/hurd.base.qcow2 -> img/hurd.accounts.qcow2 -> img/hurd.packages.qcow2
+                    -> img/hurd.kernel.qcow2   (kernel stage)
+```
+
+The `accounts` stage renames the account of the image, sets the passwords
+and installs the SSH keys; the `packages` stage installs `GUEST_PACKAGES`
+(`curl python3 gdb` by default). `make provision` is an alias for
+`accounts packages`. The base image itself is never provisioned in place,
+so it always means the same thing: the raw offline-prepared OS image.
+
+### Stage 5 - legacy single-image provisioning (`scripts/provision_base.sh`)
 
 `provision_base.sh <base.qcow2> [ssh_port]` provisions a **private copy** of the
-base image and only replaces the base when everything succeeded:
+base image and only replaces the base when everything succeeded. It is the
+pre-stage flow, kept for manual single-image provisioning; the Makefile
+drives the stage chain above instead.
 
 1. `qemu-img convert` the base into `img/.provision.XXXXXX.qcow2`.
 2. Boot that copy with QEMU (`if=ide`, `-device e1000`, user networking with
@@ -234,6 +265,112 @@ from `img/tmp/` looks for `img/tmp/img/hurd.base.qcow2`.
 
 The base image is only ever used as a read-only backing file, so it stays
 pristine; all writes land in the overlay in `img/tmp/`.
+
+### Staged image variants (`make stage`, `scripts/provision_stage.sh`)
+
+Provisioning stages can be applied one at a time, each producing its own
+image layered on top of the previous one:
+
+```
+raw -> prepared base -> accounts -> packages -> kernel -> (drivers) -> ...
+```
+
+`provision_stage.sh <stage> <in.qcow2> <out.qcow2> [ssh_port]` boots the
+input image in a throwaway overlay (the same skeleton as
+`provision_base.sh`: KVM detection, port-open wait, bounded poweroff wait,
+bounded SSH login retries), runs `provision_guest.py` with `STAGES=<stage>`,
+repairs the filesystem offline and promotes the overlay to the output image.
+A failed or interrupted stage never touches the input image: only a
+successful run replaces the output, through renaming the finished overlay
+into place.
+
+The output is not flattened: it stays a thin qcow2 image that holds only the
+writes of its stage and names the input image as backing file, so a stage
+costs its own changes, not a copy of the whole disk. The price is that a
+backing chain references its backing files by path: rebuild an upstream stage
+and the images layered on it are stale. The chain targets below rebuild the
+downstream stages for that reason; a variant that is only ever handed out on
+its own must be flattened first (`qemu-img convert`). The input and the output
+of a stage must differ.
+
+The stages and their environment (full list in `scripts/provision_guest.py`):
+
+- `accounts` - rename the account of the image, set passwords, install the
+  SSH keys. The keys live in `SSH_KEY_DIR` (default: `keys/` next to the
+  output image) and are shared across images.
+- `packages` - prune the apt sources, install `GUEST_PACKAGES`, optionally
+  upgrade (`RUN_APT_UPGRADE=1`; the marker gates the upgrade only).
+- `kernel` - copy an overlay into the guest filesystem: the
+  `CUSTOM_OVERLAY` directory (out-of-tree drivers, init scripts and
+  similar extra content) and, when `CUSTOM_KERNEL` names a kernel
+  binary, that kernel gzipped at the boot path
+  `/boot/gnumach-1.8-amd64-up.gz`. Needs at least one of the two. The
+  overlay is applied to an image created after the packages stage, never
+  into the base image: the packages image keeps the stock kernel, so a
+  broken variant is discarded and rebuilt from the chain rather than
+  repaired in place.
+
+The Makefile wraps this in the `stage` target (serialized with the same
+image lock as the other image steps):
+
+```
+make stage STAGE=kernel VARIANT=img/hurd.kernel.qcow2 \
+    CUSTOM_KERNEL=$HOME/work/x86_64-gnu-build/gnumach/gnumach
+```
+
+`STAGE_INPUT` (default: `img/hurd.base.qcow2`) names the image the stage is
+applied to, `VARIANT` (default: `img/hurd.kernel.qcow2`) the image that is
+produced. A stage also re-runs safely on an image that already carries it,
+which makes variant rebuilds reproducible: rebuild the chain from the base
+when a stage changes, or re-apply only the later stages when an early stage
+changes.
+
+Each image is thin, so `ls -la img/` shows what each stage actually wrote:
+the accounts image holds the account changes, the packages image the
+package installation, the kernel image the kernel stage: the base and the
+earlier stages are read through the backing chain, not copied.
+
+The standard chain is also encoded as real make targets, so make rebuilds
+only the stages whose input or scripts changed:
+
+```
+img/hurd.base.qcow2 -> img/hurd.accounts.qcow2 -> img/hurd.packages.qcow2
+                    -> img/hurd.kernel.qcow2   (kernel stage)
+```
+
+Building `img/hurd.kernel.qcow2` (or running `make stage` with its default
+`VARIANT`) walks that chain. The accounts and packages images are pipeline
+intermediates and are kept; a kernel variant is always rebuilt on top of the
+packages image, never into the base.
+
+The overlay is packed with tar on the host and extracted over `/` in the
+guest, so the files land at exactly the paths they have relative to the
+overlay directory and keep their modes and symlinks; ownership is
+rewritten to root, since the tar would otherwise carry the host
+account's uid and gid. `CUSTOM_KERNEL` travels in the same tar, gzipped
+at the boot path, and is checked with `gzip -t` after the extraction, so
+a corrupt kernel fails the stage instead of the next boot. The overlay
+directory may not itself carry `boot/gnumach-1.8-amd64-up.gz` when
+`CUSTOM_KERNEL` is set. Example layout that drops a translator, an init
+script and a canary for the smoke check into the image:
+
+```
+img/overlay/
+├── hurd/virtio-9p          (executable translator binary)
+├── etc/init.d/virtio-9p    (mode 755)
+└── root/overlay-marker     (shows up as /root/overlay-marker)
+```
+
+```
+make stage STAGE=kernel VARIANT=img/hurd.kernel.qcow2 \
+    CUSTOM_KERNEL=.../gnumach CUSTOM_OVERLAY=img/overlay
+```
+
+As a make prerequisite of the chain rule, `$(CUSTOM_OVERLAY)` is tracked
+through the directory mtime: entries added to or removed directly from
+the overlay directory trigger a rebuild, an edit deep inside does not
+(re-run through the prerequisite-free `stage` target or touch the
+directory).
 
 ## SSH keys
 
@@ -573,8 +710,9 @@ Every one of these was hit while building this pipeline.
     in the guest belongs to the pair in `img/keys`. A new pair has a new
     public key, so the key login fails until the new public key is installed
     in the guest, which the provisioning does. Fix: never replace the key
-    pairs; when they are lost, remove `img/keys` and run `make provision`
-    again, or log in with the password.
+    pairs; when they are lost, remove `img/keys` and rebuild the accounts
+    stage (`rm -f img/hurd.accounts.qcow2 img/hurd.packages.qcow2 &&
+    make packages`), or log in with the password.
 
 39. **The commands of the provisioning end up in the history of the guest.**
     The driver logs into an interactive shell, and every command that it
@@ -625,9 +763,9 @@ Every one of these was hit while building this pipeline.
 44. **A phony prerequisite rebuilds its target on every run.** The rule of
     the base image listed the phony target `partitionfs-build` as a
     prerequisite. make treats a phony prerequisite as always newer than the
-    target, so `make run` and `make provision` rebuilt the base image from
+    target, so `make run` and the stage targets rebuilt the base image from
     the downloaded image every time and silently threw the provisioning
-    away; a second `make provision` was never a no-op. Fix: the base image
+    away; a second `make packages` was never a no-op. Fix: the base image
     depends on real files only (the extraction stamp and the scripts). The
     check: with an up-to-date base image, `make -n run` must not print
     `prepare_base.sh`.
@@ -676,7 +814,7 @@ so no conversion to a raw file is needed.
 1. Set `VERSION` and `MD5_SUM` in `Makefile` (the MD5 of the new tarball).
 2. `make download` to fetch and verify it.
 3. Remove the old base image (`rm -f img/hurd.base.qcow2`) and run
-   `make base && make provision`.
+   `make base && make packages`.
 4. Check whether the new image still ships `/etc/ssh/sshd_config.d/`, whether
    the `root` account is still in `/etc/shadow`, and whether the GRUB layout in
    `prepare_base.sh` still matches the shipped `/boot/grub/grub.cfg`. The
@@ -726,7 +864,7 @@ its home directory, and the provisioning checks that the old name is gone
 everywhere. The renamed account gets the configured password
 (`ROOT_PASSWORD` of the `Makefile`) in the same run, so that the offline
 preparation does not have to know the name of the account of the image. A
-fresh base image (`rm -f img/hurd.base.qcow2 && make base && make provision`)
+fresh base image (`rm -f img/hurd.base.qcow2 && make base && make packages`)
 starts again with the account of the image.
 
 The accounts that get an SSH key are in `KEY_ACCOUNTS` in the same file,
@@ -734,8 +872,10 @@ together with their home directory.
 
 ### Replace the SSH keys
 
-Remove `img/keys` and run `make provision` again: the pairs are generated
-again and the new public keys are installed in the guest. The private keys of
+Remove `img/keys` and rebuild the accounts stage (`rm -f
+img/hurd.accounts.qcow2 img/hurd.packages.qcow2 && make packages`): the
+pairs are generated again and the new public keys are installed in the
+guest. The private keys of
 the old pairs stop working, and the password of the accounts keeps working in
 the meantime.
 
@@ -759,7 +899,7 @@ of `scripts/repair_filesystem.sh` (default 2).
 ```
 make distclean     # removes img/ entirely, including the download
 make base          # offline preparation, result: img/hurd.base.qcow2
-make provision     # in-VM provisioning and offline filesystem repair
+make packages      # accounts + packages stages (alias: make provision)
 ```
 
 ## Verification

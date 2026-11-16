@@ -49,7 +49,15 @@ including when the normal SSH control channel is already dead.
 - Kernel serial-log markers: `new delivery port ... for <task>` (registered),
   `release a dead delivery port` + `still N unacked irqs in entry` (a driver
   exited between fire and ack; the kernel compensates with one `__enable_irq`
-  per unacked). Benign in isolation; count them during churn.
+  per unacked). Benign in isolation; count them during churn. The
+  `new delivery port` lines double as a **process bring-up counter**: exactly
+  one per pid is the invariant, because `irqhelp_init` is once-per-process and
+  each `virtio_irq_install` registers one port. Two lines for one pid = the
+  process brought the device up twice, i.e. main fell through from a one-shot
+  mode into the daemon loop (see the virtio-blk lesson below). Reused-run logs
+  also contain NUL holes (the harness truncates the log while QEMU keeps its
+  fd and writes at the old offset): grep with `-a`, pipe through
+  `tr -d '\000'`, and remember grep line numbers include the hole.
 - The ISR read is read-to-clear: two handlers for the same virtio device (a
   selftest next to a live translator) steal each other's interrupt and one
   waiter times out. One owner per device at a time.
@@ -90,7 +98,14 @@ order:
 4. QEMU IRQ tracing for the mask/unmask story:
    `QTRACE='ioapic_*' make virtio-irq-stress` logs every device assert
    (`ioapic_set_irq`) and every guest mask/unmask write
-   (`ioapic_mem_write`) to img/tmp/qtrace.log.
+   (`ioapic_mem_write`) to img/tmp/qtrace.log. **Requires
+   `QEMU_EXTRA='-machine kernel_irqchip=split'`**: with the default
+   in-kernel irqchip the guest IOAPIC belongs to KVM and the trace log
+   stays 0 bytes. Split also slows IRQ delivery: boots may need
+   `SSH_PROBE_ATTEMPTS=400`, and one split boot showed a self-healing
+   wd0 lost-interrupt (IDE serves its IRQ through the same irqhelp
+   path) — treat isolated soft-corrected ATA timeouts as latency
+   artifacts, not media failure.
 5. Reading files out of the qcow2: qemu-nbd + nbdfuse + debugfs with the
    `file?offset=<partition-2-byte-offset>` syntax (offset 1000341504 for
    this image). The daemons must be backgrounded with polling loops (the
@@ -109,10 +124,16 @@ starve, arbitrary victim point — first exchange or teardown). The QEMU
 threads stay healthy and the vCPUs idle; the guest freezes blocked. Not a
 driver bug: putting virtio-9p on its own line (slot ≡ 1 mod 4 → PIRQ A →
 IRQ 10, harness default `VIRTIO_ADDR=0x5`) makes it disappear 4/4, and
-`VIRTIO_ADDR=` reproduces it. Suspects live in gnumach's shared-line
-ack/unmask accounting (`device/intr.c`) and possibly the ioapic edge
-programming; a host-side ioapic trace of a wedged run is the next
-evidence to collect.
+`VIRTIO_ADDR=` reproduces it. Kernel-side mechanism identified
+2026-11-15: gnumach's nested `nested_irqs[].ndisabled` counters
+(`i386/i386/irq.c:43-92`) keep a shared pin masked until **every**
+alive entry on the line acks, so one lost/unacked notification (wedged
+driver thread, `deliver_intr` `ikm_alloc` failure) starves the whole
+line with no recovery sweep for alive entries; the ioapic RMW itself is
+lock-protected (`ioapic_lock`), and this QEMU's IOAPIC v0x20 uses the
+specific-EOI path (no mask+edge workaround). An `ioapic_*` qtrace of a
+wedged run (split irqchip) showing the last `ioapic_set_irq` followed
+by mask=1 and no unmask write is the confirmation to capture.
 
 ## Landmines learned the hard way
 
@@ -131,3 +152,111 @@ evidence to collect.
   directories; do not rely on them being in git.
 - The driver's 30 s `ETIMEDOUT` prints `virtio-9p: device did not reply`; if
   a hung run never prints it, the hang is before the condvar wait, not in it.
+- When a bash boot script and the python core share an implicit contract
+  (REUSE=1 promises "guest left running"), move the contract into the
+  environment the core can read: the .sh exports REUSE and the shared
+  `finish()` skips its poweroff-on-success under REUSE=1. A silent violation
+  surfaces as the *next* REUSE run failing with "no guest answers on port".
+- Device-model evidence for blk datapath assertions comes from QEMU trace
+  events (`virtio_blk_handle_read`/`_write` with sector+nsectors,
+  `virtio_blk_rw_complete` with ret, `virtio_blk_req_complete` with status),
+  enabled via `VT_TRACE="virtio_blk*"`; the same pattern as the 9p
+  `v9fs_*` traces, grep the qemu log with `-a`.
+
+## One-shot modes in a daemon-default driver (virtio-blk harness lesson)
+
+A CLI binary whose default mode is a daemon (`virtio-blk`, and the planned
+shape of most drivers here) needs an explicit `return 0` from `main` after
+**every** one-shot mode (`--status`, `--selftest`, `--read-range`). A missing
+return falls through into the daemon loop: the process stays alive forever,
+its second bring-up shows as a second `new delivery port` line for the same
+pid, and any pipeline consuming its stdout (`--read-range | sha256sum`)
+blocks forever on EOF -- a harness timeout with no driver-side error and no
+`device did not reply`, because the driver is not stuck, it is *idling by
+design*. The give-away: the daemon's exit-stats line (`reads N (M bytes)...`)
+appearing in output of a run that was only supposed to do a one-shot read.
+When timing guest one-shots through a pipe, remember `cmd | sha256sum;
+echo $?` reports the *last* stage's rc -- a hung producer looks like a
+successful pipeline that simply never finishes; wrap in `time (...)` and
+treat tens of seconds for a 64 KiB read as the bug, not the digest.
+Note also that a harness session timeout (`Timed out after Ns`) does not
+kill the remote process; the stray exits later on its own (or on the guest
+side only if something signals it), so post-mortem IRQ-log timelines need
+the timeout moment marked before correlating with `release a dead delivery
+port` lines.
+
+## Guest-visible process table gotchas (balloon harness lessons)
+
+On this Hurd guest, plain `ps` (no args) prints **nothing** and exits 1 for
+every process whose TTY column is "-" — which is all detached daemons
+(`setsid`'d, no controlling tty), e.g. `hurd/virtio-balloon`. `ps | grep
+<name>` therefore looks like "process dead" while it is alive, and
+`ps | awk ... {print $1}` yields an empty PID field anyway ($1 is empty on
+a blank line). A harness that detects or kills daemons must use `ps -ef` (or
+`ps -A`) and read the PID from column 2 of the matching COMMAND line:
+`ps -ef | awk '/hurd\/<name>/ && !/awk/ {print $2}'`. This silently-empty
+`ps` behavior also explains daemon-detection false alarms ("daemon exited
+during bring-up") when the daemons were in fact alive and accumulating as
+strays; clean strays with `kill -TERM <pid>` before re-running.
+
+## Translator stderr under settrans-detached (virtio-blk Stage C lesson)
+
+A translator's stderr does **not** reach the QEMU serial log when started
+via `settrans -c` detached. The harness saw `virtio-blk --serve` publish
+and answer RPCs, but nothing from its init or handler paths appeared in
+the serial log. Capture it with a wrapper script passed to settrans:
+
+    #!/bin/sh
+    exec /hurd/virtio-blk --serve -v 2>>/tmp/serve.log
+
+This exposed the per-request server trace (`demux id`, `open`, `read
+recnum ...`) and made the difference between "client-side EIO" and
+"server-side silence" visible.
+
+## Storeio --no-cache byte-to-block sign error (virtio-blk Stage C lesson)
+
+The first storeio read through a translator succeeded; every subsequent
+read failed instantly with EIO without reaching the server. Root cause:
+`hurd/storeio/dev.c` converted file offsets to device blocks with
+`offs << log2_block_size` (multiplying) instead of `offs >> log2_block_size`
+(dividing) in the `--no-cache` direct read/write paths. Block 0 worked by
+accident (`0 << n == 0 >> n == 0`); block N landed `N * block_size` sectors
+past the device end, which `libstore/device.c` mapped to `D_INVALID_RECNUM`
+→ `dev_error` → `EIO`. Every other offset conversion in `dev.c` used `>>`;
+this was a lone sign error in the no-cache fast paths (read line 484,
+write line 388). Fix committed on 3p/hurd branch
+`fix/storeio-no-cache-block-shift`. The harness now omits `-c` from the
+storeio spec so the buffered path (which divides correctly) is exercised.
+
+## mig defs file argument (virtio-blk Stage C lesson)
+
+`mig` needs the `.defs` file passed as an argument, not via stdin redirect:
+a redirect silently produces no output. Use `mig ... X.sdefsi` (file as
+argument), not `mig ... < X.sdefsi`.
+
+## Dual-translator ISR stealing (virtio-blk Stage C lesson)
+
+Two translators serving the same virtio-blk device steal each other's
+read-to-clear ISR; one waiter always times out. A 30 s "timeout" observed
+during early Stage C testing was this, not a server bug — one translator
+per device at a time.
+
+## Reuse-mode vCPU livelock (open issue)
+
+Repeatedly booting the balloon harness against the same live guest
+(`REUSE=1`) can leave QEMU's `CPU 0/KVM` thread pegged at ~100% while SSH
+dies and the monitor answers: guest-side livelock with no serial-log
+progress, lasting minutes. `info balloon` on the monitor still answers
+(with a growing `actual` MB). The first stock-kernel run reached phase-3
+churn fine; the wedge appeared on the second reuse run, suggesting the
+shared-IRQ strandings the hurdkit branch fixes (ioapic pin left masked
+with IRR latched) rather than a deterministic driver bug — but the driver's
+teardown path (deflate-all then uninstall handler) must still be exercised
+on the hurdkit kernel before declaring the livelock kernel-side. If the
+wedge reproduces on the hurdkit-branch kernel, the livelock is
+balloon-driver-adjacent (the `virtio_irq_wait_config`/`vballoon_converge`
+interplay under churn) and needs driver-side investigation; if it does not,
+the shared-IRQ fix is the resolution and the driver teardown stands as
+audited. Kill the wedged QEMU (`kill -9` on the pidfile pid), remove the
+pidfile, and start fresh — a stale overlay in `img/tmp/` is harmless
+(`make clean` removes it).

@@ -30,7 +30,7 @@ with patch.object(provision_guest, "disable_unreleased_suite"), \
      patch.object(provision_guest, "set_account_password"), \
      patch.object(provision_guest, "install_authorized_keys", return_value=[]):
     try:
-        provision_guest.provision(Session(), False, ["curl", "python3"], "keys", "pw")
+        provision_guest.stage_packages(Session(), False, ["curl", "python3"])
     except provision_guest.GuestError as error:
         assert "manifest" in str(error), error
     else:

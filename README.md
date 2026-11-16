@@ -42,41 +42,45 @@ The 3p source checkouts (`mig`, `gnumach`, `glibc`, `hurd`, `9pfs`, `libpciacces
 
 | Target | What it does |
 |---|---|
-| `make base` | Build `img/hurd.base.qcow2` |
-| `make provision` | Provision the base image in-VM (idempotent) |
-| `make run` | Boot from an overlay; base stays unchanged |
+| `make base` | Build the raw OS base image `img/hurd.base.qcow2` (offline preparation only: no accounts, no SSH keys, no guest packages) |
+| `make accounts` / `make packages` | Build the staged images on top of it: `hurd.accounts.qcow2` (accounts + SSH keys), then `hurd.packages.qcow2` (+ guest packages such as gdb) |
+| `make provision` | Alias for `accounts packages` (kept for the old provision-the-base habit; the base image itself is never provisioned in place) |
+| `make run` | Boot from an overlay of the raw base; log in with the root password |
 | `make ssh` / `make ssh-peon` | SSH into the running VM (port 2222) |
-| `make guix-image` | Build the Guix 64-bit GNU/Hurd image |
-| `make guix-start` / `make guix-stop` | Boot / stop the Guix guest (port 2223) |
-| `make guix-ssh` / `make guix-ssh-peon` | SSH into the Guix guest |
-| `make guix-start-persist` | Keep the Guix guest disk state between boots |
-| `make guix-status` | Check whether the Guix guest answers on SSH |
-| `make guix-screenshot` / `make guix-run` | Capture the VGA console / run in the foreground |
-| `make guix-repair` / `make guix-reset-state` | Repair / delete the kept Guix state |
-| `make guix-authorize-host` | Authorize the host signing key for Guix archive transfers |
-| `make guix-virtio-test` | Run the virtio-9p/9pfs matrix in a disposable Guix guest |
-| `make linux-ref-image` / `make linux-ref-start` | Build / boot the Linux niri reference (port 2224) |
-| `make linux-ref-stop` / `make linux-ref-screenshot` | Stop it / capture the niri output as PPM |
-| `make stage0-harness-check` / `make stage0-check` | Test graphics tools / run the stage-0 live GPU gate |
 | `make toolchain` | Build the x86_64-gnu cross toolchain |
 | `make toolchain-docker` | Same via Docker |
 | `make fetch-3p` | Clone missing 3p source checkouts |
 | `make clean` / `make distclean` | Remove temporaries / all generated files |
 
-## What `make provision` buys you
+## The image pipeline
 
-`make provision` turns the raw qcow2 base into a ready-to-use image on top of an immutable OS base. It provisions in a throwaway VM copy, then atomically swaps the result into `img/hurd.base.qcow2` — so the base image itself never changes in place. Combined with `make run` (which boots from a copy-on-write overlay), you get reproducible, idempotent image builds on an immutable base without root privileges.
+```
+img/hurd.base.qcow2   raw, offline-prepared OS image (make base)
+  -> img/hurd.accounts.qcow2    + account rename, passwords, SSH keys (make accounts)
+  -> img/hurd.packages.qcow2    + GUEST_PACKAGES: curl, python3, gdb (make packages)
+  -> img/hurd.kernel.qcow2      + custom kernel overlay, optional (make kernel)
+```
 
-The provisioning step:
+Each stage boots its input image in a throwaway CoW overlay, applies its
+provisioning step, and promotes the overlay to the stage image — so a
+failed stage never touches its input, and `base` always means the same
+thing: the raw prepared image with no accounts or keys. Every stage is its
+own qcow2 file, so the intermediates stay visible and a rebuilt base
+propagates through the chain instead of being folded into one image.
+
+The provisioning steps (identical for the stage chain and the legacy
+single-image flow in `scripts/provision_base.sh`):
 
 * renames the `demo` account to `peon` (group, home directory, and password moved too),
 * installs the guest packages listed by `GUEST_PACKAGES` in the Makefile (e.g. `curl python3`) when any are missing,
 * generates host-side SSH key pairs for `root` and `peon` if they don't exist, and installs each public key into the guest so passwordless SSH login works,
 * verifies that key-based login works for every account,
 * optionally runs `apt-get update` and `apt-get upgrade` when `RUN_APT_UPGRADE=1` (off by default),
-* writes a `/root/.provisioned` marker so a second run is a no-op.
+* repairs the ext2 filesystem offline afterward (ext2 has no journal).
 
-The image is repaired offline afterward (ext2 has no journal) before being swapped into place.
+The test harnesses (`make virtio-test`, `make virtio-balloon-test`) boot
+from a CoW snapshot of the packages image (`qemu-img create`, not
+`convert`), which is the stage that carries both the SSH keys and gdb.
 
 Tunables (image version, URL, MD5, memory, CPU count, SSH port, root password, guest packages) live at the top of the [Makefile](./Makefile).
 
@@ -86,18 +90,19 @@ Tunables (image version, URL, MD5, memory, CPU count, SSH port, root password, g
 Makefile              # image pipeline + toolchain entry points
 nix/                  # flake.nix + flake.lock (development shell)
 toolchain/            # cross toolchain orchestration (host-local and docker backends)
-scripts/              # Debian pipeline and Guix guest management scripts
-guix/                 # Guix system declaration, goonix and driver packages
+scripts/              # Debian pipeline, virtio harnesses and Guix guest management
+guix/                 # Guix system declarations, goonix and platform packages
 guix.mk               # Guix guest make targets
-skills/BOOT.md        # detailed Debian boot/provisioning skill
 skills/GUIX.md        # Guix guest build, management and driver testing
-skills/CROSS_TESTING.md  # test cross-compiled drivers inside the Hurd VM
 tests/                # TAP tests of the scripts (run each with bash)
+skills/BOOT.md        # detailed boot/provisioning skill
+skills/CROSS_TESTING.md  # test cross-compiled drivers inside the Hurd VM
+skills/CROSSCOMPILING.md  # cross-compiling with the toolchain (gnumach example, cross nm/objdump/readelf)
 img/                  # downloaded image, base image, keys (git ignored)
 3p/                   # pinned 3p source checkouts (git ignored)
 ```
 
-See `toolchain/README.md` for toolchain build details, `skills/BOOT.md` for the boot/provisioning procedure, and `skills/CROSS_TESTING.md` for testing cross-compiled drivers in the guest.
+See `toolchain/README.md` for toolchain build details, `skills/BOOT.md` for the boot/provisioning procedure, `skills/CROSSCOMPILING.md` for cross-compiling (including the gnumach kernel and the cross `nm`/`objdump`/`readelf` workflow), and `skills/CROSS_TESTING.md` for testing cross-compiled drivers in the guest.
 
 ## Quick start
 
@@ -117,4 +122,5 @@ unchanged. The host needs a Guix daemon, on NixOS `services.guix` with
 goonix as its package (see [skills/GUIX.md](skills/GUIX.md)). Use
 `nix develop ./nix#guix`, then `make guix-image`, `make guix-start`,
 `make guix-ssh`, and `make guix-stop`. See [skills/GUIX.md](skills/GUIX.md)
-for persistent state, host archive trust, and driver testing.
+for persistent state, host archive trust, driver testing and the niri
+platform guest.
