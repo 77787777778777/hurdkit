@@ -19,6 +19,11 @@ RAW_IMG       := $(IMG_DIR)/debian-hurd-amd64-$(VERSION).img
 # be extracted again on every make invocation.
 EXTRACT_STAMP := $(IMG_DIR)/.extracted
 WORK_IMG      := $(IMG_DIR)/hurd.work.img
+# "base" is the raw, offline-prepared OS image: no accounts, no SSH keys,
+# no guest packages.  Every provisioning step lands in its own staged image
+# on top of it (accounts -> packages -> kernel), so rebuilding the base
+# never silently drops the provisioning, and the test harnesses can take
+# their CoW snapshots from the stage that matches what they need.
 BASE_IMG      := $(IMG_DIR)/hurd.base.qcow2
 TMP_DIR       := $(IMG_DIR)/tmp
 MEMORY        := 2G
@@ -44,6 +49,12 @@ STAGE_INPUT   ?= $(BASE_IMG)
 VARIANT       ?= $(IMG_DIR)/hurd.kernel.qcow2
 STAGE         ?= kernel
 CUSTOM_KERNEL ?=
+# The image the test harnesses boot: the staged packages variant carries
+# the account SSH keys (accounts stage) and gdb/python3 (packages stage),
+# unlike the raw base.  As a make prerequisite it pulls the stage chain
+# (base -> accounts -> packages) through the rules below when missing or
+# stale, so a test run never boots an image without keys.
+TEST_IMG      ?= $(IMG_DIR)/hurd.packages.qcow2
 # A host directory copied into the guest filesystem by the kernel stage,
 # for out-of-tree drivers, init scripts etc.  CUSTOM_KERNEL travels in
 # the same overlay.
@@ -52,9 +63,12 @@ CUSTOM_OVERLAY ?=
 # directory and are used to log into the guest without a password.
 SSH_KEY_DIR   := $(IMG_DIR)/keys
 # The host directory shared with the guest through virtio-9p, and the
-# standalone repo of the virtio-9p device translator.
+# standalone repo of the virtio drivers (translator and daemons).
+# VIRTIO_DIR is overridable so a workbranch (e.g. ~/src/virtio-1) can be
+# built and tested without touching the checked-out tree.
 SHARE_DIR     := $(CURDIR)/$(IMG_DIR)/share
-VIRTIO_9P_BIN := $(HOME)/src/virtio/virtio-9p
+VIRTIO_DIR    ?= $(HOME)/src/virtio
+VIRTIO_9P_BIN := $(VIRTIO_DIR)/virtio-9p
 
 # Toolchain
 QEMU_SYSTEM   := qemu-system-x86_64
@@ -68,9 +82,11 @@ RM            := rm -f
 LOCK          := flock
 LOCK_FILE     := $(IMG_DIR)/.build.lock
 
-.PHONY: all download check base provision stage run run-nokvm ssh ssh-peon clean distclean toolchain toolchain-clean toolchain-docker verify-vm hurd-build 9pfs fetch-3p
+.PHONY: all download check base accounts packages kernel provision stage run run-nokvm ssh ssh-peon clean distclean toolchain toolchain-clean toolchain-docker verify-vm hurd-build gnumach-kernel 9pfs fetch-3p
 
-all: base
+# The default builds the whole image pipeline, with every intermediate
+# exposed as its own qcow2 (see the stage rules below).
+all: base accounts packages
 
 # Download the image if missing
 $(IMG_TAR):
@@ -107,15 +123,18 @@ $(BASE_IMG): $(EXTRACT_STAMP) scripts/prepare_base.sh scripts/partition.sh
 		mv -f $(WORK_IMG).qcow2 $@; \
 		rm -f $(WORK_IMG)'
 
-# Provision the base image in-VM (idempotent: skips if already provisioned)
-provision: $(BASE_IMG)
-	@$(MKDIR_P) $(IMG_DIR)
-	@$(LOCK) $(LOCK_FILE) env ROOT_PASSWORD=$(ROOT_PASSWORD) \
-		CPU_COUNT=$(CPU_COUNT) MEMORY=$(MEMORY) \
-		RUN_APT_UPGRADE=$(RUN_APT_UPGRADE) \
-		GUEST_PACKAGES="$(GUEST_PACKAGES)" \
-		SSH_KEY_DIR="$(abspath $(SSH_KEY_DIR))" \
-		bash scripts/provision_base.sh $(BASE_IMG) $(SSH_PORT)
+# The staged provisioning chain, exposed stage by stage: each stage is its
+# own qcow2 layered on the previous one, so "base" always stays the raw
+# offline-prepared image and a base rebuild propagates through the chain
+# instead of being folded into it.
+accounts: $(IMG_DIR)/hurd.accounts.qcow2
+packages: $(IMG_DIR)/hurd.packages.qcow2
+kernel:   $(IMG_DIR)/hurd.kernel.qcow2
+
+# Provisioning alias for the old provision-the-base workflow: build the
+# accounts and packages stage images.  The base image itself is never
+# provisioned in place.
+provision: accounts packages
 
 # Apply one provisioning stage to an image and write a new image layered on
 # top of it: accounts -> packages -> kernel -> ... Each stage boots the input
@@ -172,7 +191,9 @@ $(IMG_DIR)/hurd.kernel.qcow2: $(IMG_DIR)/hurd.packages.qcow2 scripts/provision_s
 		CUSTOM_OVERLAY="$(CUSTOM_OVERLAY)" \
 		bash scripts/provision_stage.sh kernel $(abspath $<) $(abspath $@) $(SSH_PORT)
 
-# Boot from a temporary overlay so the base image stays pristine
+# Boot the image in a throwaway overlay for interactive use.  This boots
+# the raw base: log in with the root password (the accounts and SSH keys
+# live in the staged images).
 run: $(BASE_IMG)
 	$(MKDIR_P) $(TMP_DIR)
 	@OVERLAY=$$(mktemp -u $(TMP_DIR)/XXXXXX.qcow2); \
@@ -274,24 +295,38 @@ toolchain: fetch-3p    ; $(MAKE) -C toolchain toolchain
 toolchain-clean:       ; $(MAKE) -C toolchain clean
 toolchain-docker: fetch-3p ; $(MAKE) -C toolchain toolchain BACKEND=docker
 hurd-build: fetch-3p   ; $(MAKE) -C toolchain hurd
+gnumach-kernel: fetch-3p ; $(MAKE) -C toolchain gnumach-kernel
 9pfs: fetch-3p         ; $(MAKE) -C toolchain 9pfs
-virtio-9p: fetch-3p    ; $(MAKE) -C toolchain virtio-9p
+virtio-9p: fetch-3p    ; $(MAKE) -C toolchain virtio-9p VIRTIO_DIR=$(VIRTIO_DIR)
+virtio-balloon: fetch-3p    ; $(MAKE) -C toolchain virtio-balloon VIRTIO_DIR=$(VIRTIO_DIR)
 
 # Boot the guest with a host directory shared through QEMU's virtio-9p
 # device and run the translator test matrix: the device selftest, the
 # 9pfs mount gate and the Phase 3 assertions (see scripts/virtio_test.sh).
-virtio-test: 9pfs virtio-9p $(BASE_IMG)
+virtio-test: 9pfs virtio-9p $(TEST_IMG)
 	$(MKDIR_P) $(TMP_DIR) $(SHARE_DIR)
 	SSH_HOST="$(SSH_HOST)" SSH_PORT="$(SSH_PORT)" REUSE="$(REUSE)" \
+		VIRTIO_DIR="$(VIRTIO_DIR)" BASE_IMG="$(abspath $(TEST_IMG))" \
 		bash scripts/virtio_test.sh
 # Shared-IRQ churn: add/exercise/remove the driver in a loop with network
 # traffic on the e1000 line shared with virtio-9p.  Targets the
 # registration/teardown path the one-shot matrix runs at most twice; see
 # scripts/virtio_test.py phase_stress.
-virtio-irq-stress: 9pfs virtio-9p $(BASE_IMG)
+virtio-irq-stress: 9pfs virtio-9p $(TEST_IMG)
 	$(MKDIR_P) $(TMP_DIR) $(SHARE_DIR)
 	SSH_HOST="$(SSH_HOST)" SSH_PORT="$(SSH_PORT)" REUSE="$(REUSE)" \
+		VIRTIO_DIR="$(VIRTIO_DIR)" BASE_IMG="$(abspath $(TEST_IMG))" \
 		MODE=stress bash scripts/virtio_test.sh
+# Boot the guest with QEMU's virtio-balloon device and run the balloon
+# matrix: driver selftest, a host-driven inflate/deflate round trip
+# through the QEMU monitor (two-sided: guest status, device-model traces),
+# churn and the teardown path (see scripts/virtio_balloon_test.sh).
+virtio-balloon-test: virtio-balloon $(TEST_IMG)
+	$(MKDIR_P) $(TMP_DIR)
+	SSH_HOST="$(SSH_HOST)" SSH_PORT="$(SSH_PORT)" REUSE="$(REUSE)" \
+		VIRTIO_DIR="$(VIRTIO_DIR)" MODE="$(MODE)" RAM_MB="$(RAM_MB)" \
+		BASE_IMG="$(abspath $(TEST_IMG))" \
+		bash scripts/virtio_balloon_test.sh
 verify-vm: fetch-3p    ; $(MAKE) -C toolchain verify-vm
 
 # Remove temporary overlay images

@@ -49,10 +49,12 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-# The base image is overridable so that a variant (e.g. one carrying a
-# custom kernel, see CUSTOM_KERNEL in scripts/provision_base.sh) can be
-# tested without touching the stock base.
-BASE_IMG="${BASE_IMG:-${REPO_ROOT}/img/hurd.base.qcow2}"
+# The packages variant of the image pipeline: it carries the account SSH
+# keys (accounts stage) and the guest packages, unlike the raw base, so
+# the harness can log in.  make virtio-test builds the stage chain
+# (base -> accounts -> packages) automatically when it is missing or
+# stale; standalone runs can point BASE_IMG anywhere.
+BASE_IMG="${BASE_IMG:-${REPO_ROOT}/img/hurd.packages.qcow2}"
 SHARE="${SHARE:-${REPO_ROOT}/img/share}"
 MOUNT_TAG="${MOUNT_TAG:-hostshare}"
 SSH_PORT="${SSH_PORT:-2222}"
@@ -66,12 +68,14 @@ VIRTIO_ADDR="${VIRTIO_ADDR-0x5}"
 E1000_ADDR="${E1000_ADDR-}"
 SSH_KEY_DIR="${SSH_KEY_DIR:-${REPO_ROOT}/img/keys}"
 SSH_KEY="${SSH_KEY_DIR}/root_ed25519"
-VIRTIO_9P_BIN="${VIRTIO_9P_BIN:-${HOME}/src/virtio/virtio-9p}"
+VIRTIO_DIR="${VIRTIO_DIR:-${HOME}/src/virtio}"
+VIRTIO_9P_BIN="${VIRTIO_9P_BIN:-${VIRTIO_DIR}/virtio-9p}"
 P9FS_BIN="${P9FS_BIN:-${REPO_ROOT}/3p/9pfs/9pfs}"
 
 for f in "$BASE_IMG" "$SSH_KEY" "$VIRTIO_9P_BIN" "$P9FS_BIN"; do
     if [[ ! -f "$f" ]]; then
         echo "virtio-test: missing $f" >&2
+        echo "  (for $BASE_IMG: make stage STAGE=packages VARIANT=img/hurd.packages.qcow2)" >&2
         exit 1
     fi
 done
