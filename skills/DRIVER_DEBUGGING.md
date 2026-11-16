@@ -144,3 +144,37 @@ by mask=1 and no unmask write is the confirmation to capture.
   directories; do not rely on them being in git.
 - The driver's 30 s `ETIMEDOUT` prints `virtio-9p: device did not reply`; if
   a hung run never prints it, the hang is before the condvar wait, not in it.
+
+## Guest-visible process table gotchas (balloon harness lessons)
+
+On this Hurd guest, plain `ps` (no args) prints **nothing** and exits 1 for
+every process whose TTY column is "-" — which is all detached daemons
+(`setsid`'d, no controlling tty), e.g. `hurd/virtio-balloon`. `ps | grep
+<name>` therefore looks like "process dead" while it is alive, and
+`ps | awk ... {print $1}` yields an empty PID field anyway ($1 is empty on
+a blank line). A harness that detects or kills daemons must use `ps -ef` (or
+`ps -A`) and read the PID from column 2 of the matching COMMAND line:
+`ps -ef | awk '/hurd\/<name>/ && !/awk/ {print $2}'`. This silently-empty
+`ps` behavior also explains daemon-detection false alarms ("daemon exited
+during bring-up") when the daemons were in fact alive and accumulating as
+strays; clean strays with `kill -TERM <pid>` before re-running.
+
+## Reuse-mode vCPU livelock (open issue)
+
+Repeatedly booting the balloon harness against the same live guest
+(`REUSE=1`) can leave QEMU's `CPU 0/KVM` thread pegged at ~100% while SSH
+dies and the monitor answers: guest-side livelock with no serial-log
+progress, lasting minutes. `info balloon` on the monitor still answers
+(with a growing `actual` MB). The first stock-kernel run reached phase-3
+churn fine; the wedge appeared on the second reuse run, suggesting the
+shared-IRQ strandings the hurdkit branch fixes (ioapic pin left masked
+with IRR latched) rather than a deterministic driver bug — but the driver's
+teardown path (deflate-all then uninstall handler) must still be exercised
+on the hurdkit kernel before declaring the livelock kernel-side. If the
+wedge reproduces on the hurdkit-branch kernel, the livelock is
+balloon-driver-adjacent (the `virtio_irq_wait_config`/`vballoon_converge`
+interplay under churn) and needs driver-side investigation; if it does not,
+the shared-IRQ fix is the resolution and the driver teardown stands as
+audited. Kill the wedged QEMU (`kill -9` on the pidfile pid), remove the
+pidfile, and start fresh — a stale overlay in `img/tmp/` is harmless
+(`make clean` removes it).
