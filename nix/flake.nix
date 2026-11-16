@@ -4,8 +4,9 @@
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
   # goonix is our fork of GNU Guix. flake.lock pins the exact commit of it;
-  # that pin is what replaces Guix channels and "guix pull" here.
-  inputs.goonix.url = "github:77787777778777/goonix";
+  # that pin is what replaces Guix channels and "guix pull" here. Our work is
+  # on its goonix branch; its main branch mirrors upstream Guix.
+  inputs.goonix.url = "github:hurdkit/goonix/goonix";
 
   outputs =
     { self, nixpkgs, goonix }:
@@ -33,10 +34,6 @@
             e2fsprogs # debugfs, e2fsck, dumpe2fs
             libnbd # nbdfuse, for the offline repair of a qcow2 image
             openssh # ssh, scp, ssh-keygen
-            socat # Unix-socket transport for scripts/qmp.tcl
-            tcl # Tcl tools and tcllib's JSON support
-            tclPackages.tcllib
-            gcc # tests/fake_qmp.c fixture compiler
             (python3.withPackages (ps: [ ps.pexpect ])) # scripts/provision_guest.py
             git
             gawk
@@ -44,7 +41,6 @@
             gnugrep
             coreutils
             file
-            imagemagick # niri PNG -> PPM for accelerated guest screenshots
             which
 
             # --- cross toolchain (make toolchain) ---
@@ -105,7 +101,14 @@
         guix = pkgs.mkShell {
           name = "hurdkit-guix";
           inputsFrom = [ self.devShells.${system}.default ];
-          packages = [ goonix.packages.${system}.default ];
+          packages = [
+            goonix.packages.${system}.default
+            # Graphics harness of the Guix and Linux reference guests.
+            pkgs.tcl # scripts/qmp.tcl and scripts/ppm_check.tcl
+            pkgs.tclPackages.tcllib # their JSON support
+            pkgs.socat # QMP over a Unix socket for scripts/qmp.tcl
+            pkgs.imagemagick # niri PNG -> PPM for accelerated screenshots
+          ];
         };
       };
     };

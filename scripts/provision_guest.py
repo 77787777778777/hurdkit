@@ -739,18 +739,6 @@ def stage_packages(session, run_apt_upgrade, packages):
     disable_unreleased_suite(session)
     install_packages(session, packages)
 
-    # Record what this provisioning installed. The host-side no-op check
-    # compares this manifest with GUEST_PACKAGES, so adding a package later
-    # still boots an already provisioned image. Images provisioned before
-    # this file existed retain the default package list in the host check.
-    package_manifest = " ".join(packages)
-    status = session.run_command(
-        f"printf '%s\\n' '{package_manifest}' > /root/.provision-packages",
-        "package_manifest",
-    )
-    if status != 0:
-        raise GuestError("Could not write the package manifest in the guest")
-
     if session.run_command("test -f /root/.provisioned", "marker") == 0:
         print("Image is already provisioned.", flush=True)
         return
@@ -767,6 +755,7 @@ def stage_packages(session, run_apt_upgrade, packages):
     else:
         print("Skipping apt update and apt upgrade (RUN_APT_UPGRADE is not set).", flush=True)
 
+    # Write the provision marker
     session.run_command("touch /root/.provisioned", "marker_write")
 
 

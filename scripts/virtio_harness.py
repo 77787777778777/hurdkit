@@ -18,13 +18,9 @@ Configuration comes from the environment (the boot scripts export it):
     SSH_KEY              private key of the guest's root account
     QEMU_LOG             path of the QEMU serial log (traces land here; it
                          is dumped on failure)
-    GDB                  "1" dumps stacks of the processes matching the
-                         harness's pattern when the matrix fails
-    VIRTIO_GDB_COMMAND   debugger command; unset means gdb, installed
-                         through apt in the Debian guest if needed
-    VIRTIO_HALT_COMMAND  shutdown command (Guix uses halt, Debian poweroff)
-    VIRTIO_POWEROFF_TIMEOUT seconds to wait for the connection to close
-    VIRTIO_NO_POWEROFF   "1" leaves the guest to the Guix lifecycle wrapper
+    GDB                  "1" installs gdb in the guest and dumps stacks
+                         of the processes matching the harness's pattern
+                         when the matrix fails
 
 Guest-side process checks use `ps -ef`, never plain `ps`: on this guest
 plain `ps` silently prints nothing (and exits 1) for processes whose TTY
@@ -55,9 +51,6 @@ SSH_PORT = int(os.environ.get("SSH_PORT", "2222"))
 SSH_KEY = os.environ.get("SSH_KEY", "img/keys/root_ed25519")
 QEMU_LOG = os.environ.get("QEMU_LOG", "")
 WANT_GDB = os.environ.get("GDB", "0") == "1"
-GDB_COMMAND = os.environ.get("VIRTIO_GDB_COMMAND")
-HALT_COMMAND = os.environ.get("VIRTIO_HALT_COMMAND", "poweroff")
-POWEROFF_TIMEOUT = int(os.environ.get("VIRTIO_POWEROFF_TIMEOUT", "120"))
 
 LOGIN_TIMEOUT = 120
 # sshd comes up well after QEMU starts accepting connections, and pexpect
@@ -145,8 +138,6 @@ class GuestSession:
         printed, so the harness can report it instead of hanging.
         """
         command = command.rstrip().rstrip(";").rstrip()
-        if os.environ.get("VIRTIO_NO_SETSID") == "1":
-            command = re.sub(r"\bsetsid\s+(?=[^\s;&|]+)", "", command)
         self.child.send(f"{{ {command} ; }} 2>&1; echo \"__RC__$?__\"\r")
         index = self.child.expect(
             [EXIT_STATUS, pexpect.EOF, pexpect.TIMEOUT], timeout=timeout
@@ -164,9 +155,9 @@ class GuestSession:
         return status, output
 
     def poweroff(self):
-        self.child.send(HALT_COMMAND + "\r")
+        self.child.send("poweroff\r")
         try:
-            self.child.expect(pexpect.EOF, timeout=POWEROFF_TIMEOUT)
+            self.child.expect(pexpect.EOF, timeout=120)
         except pexpect.TIMEOUT:
             pass
 
@@ -292,14 +283,8 @@ def gdb_backtraces(session, ps_pattern, command_template):
     "the command hung" to "this RPC is stuck here".  COMMAND_TEMPLATE is
     formatted with the pid; pass the binary when the unwinding needs it.
     """
-    if GDB_COMMAND:
-        status, out = session.run(f"command -v {GDB_COMMAND}")
-        if status != 0:
-            print(f"--- debugger {GDB_COMMAND} is unavailable ---", flush=True)
-            return
-    else:
-        session.run("command -v gdb >/dev/null || apt-get install -y gdb",
-                    timeout=600)
+    session.run("command -v gdb >/dev/null || apt-get install -y gdb",
+                timeout=600)
     for pid in guest_pids(session, ps_pattern):
         try:
             _, bt = session.run(
@@ -324,8 +309,7 @@ def finish(session):
     if failed:
         print("failed: " + ", ".join(failed), flush=True)
         return 1
-    if (session is not None and os.environ.get("REUSE") != "1"
-            and os.environ.get("VIRTIO_NO_POWEROFF") != "1"):
+    if session is not None and os.environ.get("REUSE") != "1":
         try:
             session.poweroff()
         except Exception:  # noqa: BLE001 - poweroff is best effort

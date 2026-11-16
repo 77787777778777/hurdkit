@@ -423,7 +423,7 @@ def dump_guest_state(session):
     if vh.WANT_GDB:
         vh.gdb_backtraces(
             session, r"hurd\/virtio-blk",
-            f"{vh.GDB_COMMAND or 'gdb'} /hurd/virtio-blk -p {{pid}} -batch "
+            "gdb /hurd/virtio-blk -p {pid} -batch "
             "-ex 'thread apply all bt' 2>&1")
 
 

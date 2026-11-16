@@ -90,11 +90,11 @@ Tunables (image version, URL, MD5, memory, CPU count, SSH port, root password, g
 Makefile              # image pipeline + toolchain entry points
 nix/                  # flake.nix + flake.lock (development shell)
 toolchain/            # cross toolchain orchestration (host-local and docker backends)
-scripts/              # Debian pipeline, virtio harnesses and Guix guest management
-guix/                 # Guix system declarations, goonix and platform packages
-guix.mk               # Guix guest make targets
-skills/GUIX.md        # Guix guest build, management and driver testing
-tests/                # TAP tests of the scripts (run each with bash)
+scripts/              # prepare_base.sh, provision_base.sh, provision_guest.py, repair_filesystem.sh, partition.sh
+guix/                 # Guix GNU/Hurd guest: system declarations and packages
+guix.mk               # make targets of the Guix guest (guix-*)
+skills/GUIX.md        # build, run and test the Guix guest
+tests/                # TAP tests of the Guix guest scripts
 skills/BOOT.md        # detailed boot/provisioning skill
 skills/CROSS_TESTING.md  # test cross-compiled drivers inside the Hurd VM
 skills/CROSSCOMPILING.md  # cross-compiling with the toolchain (gnumach example, cross nm/objdump/readelf)
@@ -114,13 +114,8 @@ make run           # boots from an overlay, SSH on 127.0.0.1:2222
 
 ## Guix guest (64-bit GNU/Hurd)
 
-The Guix guest is built from `guix/hurd64.scm` with goonix, our fork of Guix,
-at the revision pinned in `nix/flake.lock`; the guest's own Guix is the same
-goonix commit (`guix/goonix.scm`). It uses the same SSH keys and account names
-as the Debian guest, and boots from overlays so its base image stays
-unchanged. The host needs a Guix daemon, on NixOS `services.guix` with
-goonix as its package (see [skills/GUIX.md](skills/GUIX.md)). Use
-`nix develop ./nix#guix`, then `make guix-image`, `make guix-start`,
-`make guix-ssh`, and `make guix-stop`. See [skills/GUIX.md](skills/GUIX.md)
-for persistent state, host archive trust, driver testing and the niri
-platform guest.
+A second, independent guest is declared with Guix in `guix/hurd64.scm` and
+built by goonix, a Guix fork pinned in `nix/flake.lock`. It shares only the
+SSH keys in `img/keys/` with the Debian guest. Work on it inside
+`nix develop ./nix#guix`; [skills/GUIX.md](skills/GUIX.md) describes how to
+build, boot and test it.

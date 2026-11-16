@@ -7,13 +7,14 @@
       "locked": {
         "lastModified": 1794685728,
         "narHash": "sha256-W76OnyS7hpk1YIj/DPFh51ilDJ9dyqNHAL4I91UcsWo=",
-        "owner": "77787777778777",
+        "owner": "hurdkit",
         "repo": "goonix",
         "rev": "630ee3040cf582fc5a11afbbaf1702d01e1702cc",
         "type": "github"
       },
       "original": {
-        "owner": "77787777778777",
+        "owner": "hurdkit",
+        "ref": "goonix",
         "repo": "goonix",
         "type": "github"
       }

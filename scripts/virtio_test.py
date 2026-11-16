@@ -86,8 +86,7 @@ def dump_guest_state(session):
     if vh.WANT_GDB:
         vh.gdb_backtraces(
             session, TRANSLATOR_PS,
-            f"{vh.GDB_COMMAND or 'gdb'} -p {{pid}} -batch "
-            "-ex 'thread apply all bt' 2>&1")
+            "gdb -p {pid} -batch -ex 'thread apply all bt' 2>&1")
 
 
 def phase1(session):

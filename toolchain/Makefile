@@ -208,7 +208,6 @@ glibc: gnumach mig hurd-headers
 	else \
 	    rm -rf $(BUILD)/glibc && mkdir -p $(BUILD)/glibc && cd $(BUILD)/glibc && \
 	    PATH=$(PREFIX)/bin:$$PATH \
-	    CC=$(PREFIX)/bin/x86_64-gnu-gcc \
 	    CXX=false \
 	    CPPFLAGS="-idirafter $(REPO_ROOT)/3p/hurd -idirafter $(PREFIX)/include -DUNIXOID_TRAPS=0" \
 	    CPATH=$(PREFIX)/include \
@@ -233,14 +232,7 @@ tooldir:
 	    echo "tooldir: leaving existing include directory"; \
 	else ln -sfnT $(PREFIX)/include $(PREFIX)/x86_64-gnu/include; fi
 	@if [ -d $(PREFIX)/x86_64-gnu/lib ] && [ ! -L $(PREFIX)/x86_64-gnu/lib ]; then \
-	    if [ -n "$$(find $(PREFIX)/x86_64-gnu/lib -mindepth 1 -maxdepth 1 ! -name ldscripts -print -quit)" ]; then \
-	        echo "tooldir: leaving existing lib directory"; \
-	    else \
-	        mkdir -p $(PREFIX)/lib/ldscripts; \
-	        cp -a $(PREFIX)/x86_64-gnu/lib/ldscripts/. $(PREFIX)/lib/ldscripts/; \
-	        rm -rf $(PREFIX)/x86_64-gnu/lib; \
-	        ln -sT $(PREFIX)/lib $(PREFIX)/x86_64-gnu/lib; \
-	    fi; \
+	    echo "tooldir: leaving existing lib directory"; \
 	else ln -sfnT $(PREFIX)/lib $(PREFIX)/x86_64-gnu/lib; fi
 
 
@@ -305,7 +297,7 @@ mig: gnumach
 	@echo "=== gate: mig ==="
 	$(PREFIX)/bin/mig --help | head -1
 
-hurd: mig glibc tooldir
+hurd: mig glibc
 	@if ls $(PREFIX)/lib/libshouldbeinlibc.so >/dev/null 2>&1; then \
 	    echo "(skipping: hurd libraries already installed)"; \
 	else \

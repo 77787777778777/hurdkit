@@ -54,7 +54,7 @@ BALLOON_STEP_MB = int(os.environ.get("BALLOON_STEP_MB", str(min(256, RAM_MB // 8
 # Convergence of a 256 MiB balloon is ~1k queue round trips plus the
 # chunk allocations behind them; give it room, but bound it.
 CONVERGE_TIMEOUT = 600
-MONITOR_PATH = os.environ.get("VIRTIO_MONITOR_SOCKET") or os.path.join(
+MONITOR_PATH = os.path.join(
     os.path.dirname(vh.QEMU_LOG) or ".", "virtio-balloon-test-monitor.sock")
 DAEMON_LOG = "/tmp/virtio-balloon.log"
 
@@ -257,7 +257,7 @@ def dump_guest_state(session):
     if vh.WANT_GDB:
         vh.gdb_backtraces(
             session, r"hurd\/virtio-balloon",
-            f"{vh.GDB_COMMAND or 'gdb'} /hurd/virtio-balloon -p {{pid}} -batch "
+            "gdb /hurd/virtio-balloon -p {pid} -batch "
             "-ex 'thread apply all bt' 2>&1")
 
 

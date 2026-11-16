@@ -35,14 +35,6 @@ toolchain — see `toolchain/Makefile` and `toolchain/README.md` for that.
 - Optional: a test harness or server for end-to-end exercise (for a
   filesystem translator, a 9P server such as `toolchain/9p-server.py`).
 
-## Testing in the Guix guest
-
-The standalone toolchain binaries use `/lib/ld-x86-64.so.1`, but the Guix
-guest has no `/lib` and keeps its libraries in `/gnu/store`. They also need
-the same glibc and Hurd library versions as the guest. Build drivers as Guix
-packages instead of copying the standalone binary directly; see
-[GUIX.md](GUIX.md) and `guix/9pfs.scm` for the 9pfs example.
-
 ## Goal
 
 A cross-compiled Hurd driver binary is verified to:
