@@ -178,6 +178,10 @@ programs in it; `scripts/stage1_check.sh` lists them. The guest has:
   zero, so the file's mappings keep working. `tmpfs-shm DIRECTORY`
   (`tests/hurd/tmpfs-shm.c`) checks it on `/dev/shm`, and on ext2 as the
   control; it also runs on Linux.
+- `hurd-epoll-shim`, the epoll, eventfd, timerfd and signalfd library for
+  the libwayland port, with its TAP suites (`hurd-epoll-shim-test-NAME`).
+  It lives in its own repository, github.com/hurdkit/hurd-epoll-shim, and
+  `(hurdkit packages base)` pins the commit.
 
 ## Pitfalls
 
