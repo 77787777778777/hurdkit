@@ -141,6 +141,10 @@ vt_boot() {
 # Wait for a guest that powered itself off (the python matrix's success
 # path), so the next boot can bind the same forwarded port.
 vt_wait_poweroff() {
+    # When reusing a guest we didn't start, VT_QEMU_PID is unset;
+    # there's nothing to wait for or clean up.
+    [[ -z "${VT_QEMU_PID:-}" ]] && return 0
+
     local attempt
     for attempt in $(seq 1 60); do
         if ! kill -0 "$VT_QEMU_PID" 2>/dev/null; then
