@@ -146,6 +146,26 @@ Read `img/guix/serial-N.log` (`.serial-current` names the active boot;
 monitor 'info pci'` talks to the QEMU monitor. A boot that times out gets a
 fresh overlay; a kept state is repaired before the next attempt.
 
+### Package modules, GNU Mach and Hurd variants
+
+Packages of this repository are Guile modules under `guix/modules/hurdkit/`;
+`guix_vm.sh` and the test scripts pass `-L guix/modules`. Build one with
+`guix build -L guix/modules --target=x86_64-pc-gnu NAME`. A module that
+does not compile breaks every image build: `make guix-test` (its
+`guix-packages.t`) shows which.
+
+`(hurdkit packages hurd)` has `gnumach-hurdkit` (Hurdkit's GNU Mach, with
+its shared-interrupt fixes) and `hurd-hurdkit`, a newer Hurd, each at a
+commit that the module pins. `hurd-hurdkit` carries two compatibility
+patches for goonix's older rumpkernel and GNU Mach headers, and builds
+serially (G23).
+
+`operating-system-with-hurd` from `(hurdkit system)` replaces the Hurd of a
+system: the boot servers, and also `pfinet`, the console, getty and login,
+whose services otherwise keep starting goonix's default Hurd. In such a
+guest, `ps -ef` shows every translator from the one Hurd.
+`guix/hurd64-hurdkit.scm` is the guest with both.
+
 ## Pitfalls
 
 **G1. An image built by another Guix is a different system.** Another
@@ -231,6 +251,10 @@ first. A link renamed after the build no longer protects the image.
 **G19. A Unix socket path has at most 107 bytes.** The sockets that talk
 to QEMU therefore live in `$XDG_RUNTIME_DIR`, named after the SSH port.
 
+**G23. The newer Hurd's `make -j` is racy.** `utils/` fails with `No rule to
+make target 'auth_requestUser.stamp'`, often enough that `hurd-hurdkit`
+builds serially.
+
 ## Verification
 
 Run these in `nix develop ./nix#guix`. Each command exits with zero status
@@ -240,3 +264,4 @@ when its checks pass and prints what failed otherwise.
 |---|---|
 | Scripts and declarations (boots nothing) | `make guix-test` |
 | The guest boots, answers and halts | `make guix-image guix-start guix-ssh-peon guix-stop` |
+| The guest with Hurdkit's GNU Mach and Hurd | `GUIX_DIR=$PWD/img/guix-hurdkit GUIX_SSH_PORT=2225 GUIX_OS=$PWD/guix/hurd64-hurdkit.scm bash scripts/guix_vm.sh image`, then `start`, `ssh root ps -ef` and `stop` the same way |
