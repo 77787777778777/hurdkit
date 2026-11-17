@@ -103,7 +103,11 @@
           inputsFrom = [ self.devShells.${system}.default ];
           packages = [
             goonix.packages.${system}.default
-            pkgs.tcl # scripts/ppm_check.tcl
+            # Graphics harness of the Guix and Linux reference guests.
+            pkgs.tcl # scripts/qmp.tcl and scripts/ppm_check.tcl
+            pkgs.tclPackages.tcllib # their JSON support
+            pkgs.socat # QMP over a Unix socket for scripts/qmp.tcl
+            pkgs.imagemagick # niri PNG -> PPM for accelerated screenshots
           ];
         };
       };

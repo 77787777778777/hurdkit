@@ -11,11 +11,13 @@
 #   status             say whether the guest runs and answers on SSH
 #   ssh USER [CMD...]  run a command in the guest (a login shell without CMD)
 #   stop               shut the guest down (halt, then stop QEMU)
-#   screenshot [FILE]  save the VGA console of the guest as a PPM picture
+#   screenshot [FILE]  save the guest output as a PPM picture
 #   run                boot in the foreground with a throw-away disk
 #   repair             check and repair the root filesystem of the kept state
 #   reset-state        delete the kept disk state
 #   monitor COMMAND    send a command to the QEMU human monitor
+#   qmp COMMAND ...    use QMP: status, screenshot, key, motion, button, quit
+#   print-options      print QEMU graphics, tracing and control arguments
 #
 # The base image is never booted: the guest always runs from a
 # copy-on-write overlay, so the base image stays as Guix built it.
@@ -25,19 +27,21 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+SCRIPT_DIR="${GUIX_SCRIPT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+REPO_ROOT="${GUIX_REPO_ROOT:-$(cd "$SCRIPT_DIR/.." && pwd)}"
+GUIX_SSH_PORT="${GUIX_SSH_PORT:-2223}"
+GUIX_DIR="${GUIX_DIR:-$REPO_ROOT/img/guix}"
+GUIX_MEMORY="${GUIX_MEMORY:-2048}"
+QMP_SOCKET="${QMP_SOCKET:-${XDG_RUNTIME_DIR:-/tmp}/hurdkit-guix-${GUIX_SSH_PORT}.qmp}"
+source "$SCRIPT_DIR/guix_qemu_options.sh"
 
 GUIX="${GUIX:-guix}"
 GUIX_OS="${GUIX_OS:-$REPO_ROOT/guix/hurd64.scm}"
 GUIX_IMAGE_TYPE="${GUIX_IMAGE_TYPE:-hurd64-qcow2}"
 # Extra options for "guix system image", for example "--image-size=8G".
 GUIX_IMAGE_OPTS="${GUIX_IMAGE_OPTS:-}"
-GUIX_DIR="${GUIX_DIR:-$REPO_ROOT/img/guix}"
 SSH_KEY_DIR="${SSH_KEY_DIR:-$REPO_ROOT/img/keys}"
 SSH_HOST="${SSH_HOST:-127.0.0.1}"
-GUIX_SSH_PORT="${GUIX_SSH_PORT:-2223}"
-GUIX_MEMORY="${GUIX_MEMORY:-2048}"
 # Optional QEMU arguments for "start", supplied after "--". Positional
 # parameters preserve spaces in paths and options across script boundaries.
 # Bash arrays cannot be exported into a child script.
@@ -146,19 +150,24 @@ kill_qemu() {
         sleep 1
     done
     kill -9 "$pid" 2>/dev/null || true
-    rm -f "$PID_FILE" "$MONITOR_SOCKET"
+    rm -f "$PID_FILE"
+    if [[ -z "$(qemu_pid)" ]]; then
+        rm -f "$MONITOR_SOCKET" "$QMP_SOCKET"
+    fi
 }
 
 qemu_command() {
-    local disk="$1"; shift
+    local disk="$1"
+    local -a caller_args=("${@:2}")
     local -a accel=() extra=()
+    guix_qemu_options || return 1
     if declare -p GUIX_VM_EXTRA_ARGS >/dev/null 2>&1; then
         extra=("${GUIX_VM_EXTRA_ARGS[@]}")
     fi
     local arg
     for arg in "${extra[@]}"; do
         case "$arg" in
-            -hda|-pidfile|-monitor|-serial|-netdev|-daemonize)
+            -hda|-pidfile|-monitor|-qmp|-serial|-netdev|-daemonize|-display)
                 die "QEMU option $arg is managed by guix_vm.sh; do not override it"
                 ;;
         esac
@@ -174,7 +183,7 @@ qemu_command() {
     "$QEMU_SYSTEM" -M q35 "${accel[@]}" -m "$GUIX_MEMORY" \
         -device e1000,netdev=net0 \
         -netdev "user,id=net0,hostfwd=tcp:${SSH_HOST}:${GUIX_SSH_PORT}-:${GUEST_SSH_PORT}" \
-        -hda "$disk" "${extra[@]}" "$@"
+        -hda "$disk" "${GUIX_QEMU_OPTIONS[@]}" "${extra[@]}" "${caller_args[@]}"
 }
 
 new_overlay() {
@@ -257,6 +266,9 @@ cmd_start() {
     need "$QEMU_SYSTEM"; need "$QEMU_IMG"
     [[ -f "$BASE_IMG" ]] || die "no base image; build it first (make guix-image)"
     [[ -z "$(qemu_pid)" ]] || die "the guest is already running (pid $(qemu_pid))"
+    [[ -n "$QEMU_SYSTEM" ]] || die "QEMU_SYSTEM is empty"
+    # Populate this array before expanding it in the launch command below.
+    guix_qemu_options || return 1
     case "$mode" in
         "")
             disk="$RUN_IMG"
@@ -289,11 +301,10 @@ cmd_start() {
         SERIAL_LOG="$GUIX_DIR/serial-$attempt.log"
         : > "$SERIAL_LOG"
         printf '%s\n' "$SERIAL_LOG" > "$GUIX_DIR/.serial-current"
-        rm -f "$MONITOR_SOCKET"
-        # The monitor socket lets the host talk to QEMU itself, for example
-        # to take a screenshot of the VGA console (make guix-screenshot).
-        qemu_command "$disk" -display none -serial "file:$SERIAL_LOG" \
-            -monitor "unix:$MONITOR_SOCKET,server,nowait" \
+        rm -f "$MONITOR_SOCKET" "$QMP_SOCKET"
+        # The monitor and QMP sockets let the host talk to QEMU itself.
+        qemu_command "$disk" "${GUIX_QEMU_DISPLAY_OPTIONS[@]}" -serial "file:$SERIAL_LOG" \
+            -monitor "unix:$MONITOR_SOCKET,server=on,wait=off" \
             -pidfile "$PID_FILE" -daemonize
         echo "guix_vm: boot $attempt/$GUIX_BOOT_ATTEMPTS: QEMU started (pid $(qemu_pid)), disk $disk"
         if wait_for_ssh "$GUIX_BOOT_TIMEOUT"; then
@@ -389,28 +400,20 @@ cmd_stop() {
     (( clean ))
 }
 
-cmd_screenshot() {
-    local out="${1:-$GUIX_DIR/screen.ppm}"
+cmd_qmp() {
     [[ -n "$(qemu_pid)" ]] || die "the guest is not running"
-    [[ -S "$MONITOR_SOCKET" ]] || die "no monitor socket: $MONITOR_SOCKET"
-    need python3
-    # The QEMU monitor writes the picture of the VGA screen as a PPM file.
-    python3 -I - "$MONITOR_SOCKET" "$(readlink -f "$(dirname "$out")")/$(basename "$out")" <<'PY'
-import socket, sys, time
-path, out = sys.argv[1], sys.argv[2]
-s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-s.connect(path)
-s.settimeout(2)
-try:
-    s.recv(65536)
-except socket.timeout:
-    pass
-s.sendall(("screendump " + out + "\n").encode())
-time.sleep(1)
-s.close()
-PY
-    [[ -s "$out" ]] || die "QEMU did not write $out"
-    echo "guix_vm: screenshot $out"
+    [[ -S "$QMP_SOCKET" ]] || die "no QMP socket: $QMP_SOCKET"
+    need tclsh
+    tclsh "$SCRIPT_DIR/qmp.tcl" "$@"
+}
+
+cmd_screenshot() {
+    [[ -n "$(qemu_pid)" ]] || die "the guest is not running"
+    if [[ "${GUIX_GPU:-none}" == none ]]; then
+        cmd_qmp screenshot "${1:-$GUIX_DIR/screen.ppm}"
+    else
+        cmd_qmp screenshot "${1:-$GUIX_DIR/screen.ppm}" gpu0 0
+    fi
 }
 
 cmd_run() {
@@ -503,8 +506,14 @@ cmd_reset_state() {
     echo "guix_vm: kept state removed"
 }
 
+cmd_print_options() {
+    guix_qemu_options
+    printf '%q ' "${GUIX_QEMU_OPTIONS[@]}" "${GUIX_QEMU_DISPLAY_OPTIONS[@]}"
+    echo
+}
+
 command="${1:-}"
-[[ -n "$command" ]] || die "usage: guix_vm.sh image|start [persist] [-- QEMU-ARG...]|status|ssh USER [CMD...]|stop|screenshot [FILE]|run|repair|reset-state|monitor COMMAND"
+[[ -n "$command" ]] || die "usage: guix_vm.sh image|start [persist] [-- QEMU-ARG...]|status|ssh USER [CMD...]|stop|screenshot [FILE]|run|repair|reset-state|monitor COMMAND|qmp COMMAND|print-options"
 shift
 case "$command" in
     image)       cmd_image "$@" ;;
@@ -529,5 +538,7 @@ case "$command" in
     repair)      cmd_repair "$@" ;;
     reset-state) cmd_reset_state "$@" ;;
     monitor)     cmd_monitor "$@" ;;
+    qmp)         cmd_qmp "$@" ;;
+    print-options) cmd_print_options "$@" ;;
     *)           die "unknown command: $command" ;;
 esac

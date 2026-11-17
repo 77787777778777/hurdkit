@@ -102,3 +102,31 @@ stage2-check:
 
 stage2-reference:
 	@bash scripts/stage2_check.sh reference
+
+# --- Graphics (skills/GUIX.md). The defaults leave the guest headless. ---
+
+# GUIX_GPU: none, 2d, virgl, venus or nctx; GUIX_DISPLAY: none,
+# egl-headless or gtk; GUIX_HOST_GPU: amd or nvidia, the host GPU that
+# renders for egl-headless and Venus.
+GUIX_GPU         ?= none
+GUIX_DISPLAY     ?= none
+GUIX_HOST_GPU    ?=
+GUIX_VK_DEVICE   ?=
+GUIX_VENUS_MEMFD ?= 0
+# QEMU trace event pattern and file, e.g. GUIX_TRACE='virtio_gpu_cmd_*'
+GUIX_TRACE       ?=
+GUIX_TRACE_FILE  ?=
+# Virtual CPUs; empty means QEMU's default of one.
+GUIX_CPUS        ?=
+# Arguments of guix-qmp, e.g. GUIX_QMP_ARGS=status (see scripts/qmp.tcl).
+GUIX_QMP_ARGS    ?=
+
+# scripts/guix_vm.sh reads them from its environment.
+export GUIX_GPU GUIX_DISPLAY GUIX_HOST_GPU GUIX_VK_DEVICE GUIX_VENUS_MEMFD \
+	GUIX_TRACE GUIX_TRACE_FILE GUIX_CPUS
+
+.PHONY: guix-qmp
+
+# Send a QMP command to the running guest
+guix-qmp:
+	@$(GUIX_VM) qmp $(GUIX_QMP_ARGS)

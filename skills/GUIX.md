@@ -226,6 +226,24 @@ The packages:
 When one of these is cross-built, `wayland-scanner` and the protocol
 descriptions come from goonix's own Wayland for the build machine.
 
+### Graphics harness
+
+`GUIX_GPU` (`none`, `2d`, `virgl`, `venus`, `nctx`) adds a virtio-gpu
+device, `GUIX_DISPLAY` (`none`, `egl-headless`, `gtk`) the display, and
+`GUIX_HOST_GPU` (`amd`, `nvidia`) the host GPU that renders, found by its
+driver in sysfs. For Venus, the host's Vulkan ICD of that GPU is selected
+through `VK_DRIVER_FILES`; `GUIX_VK_DEVICE` and `GUIX_VK_ICD_FILE` override
+it. `GUIX_TRACE='virtio_gpu_cmd_*'` records QEMU trace events into
+`GUIX_TRACE_FILE`, `GUIX_CPUS` sets the number of CPUs, and
+`GUIX_QEMU_ARGS` adds QEMU options. The defaults leave the guest as it was.
+
+Every guest has a QMP socket next to its monitor socket. `make guix-qmp
+GUIX_QMP_ARGS=...` runs `scripts/qmp.tcl`: `status`, `screenshot FILE
+[DEVICE HEAD]`, `key super+t`, `motion X Y`, `button left down`, `trace
+on|off PATTERN`, `execute JSON`. `scripts/ppm_check.tcl` checks screenshots:
+`dimensions`, `region` (mostly one colour), `differs` (at most N percent of
+the pixels differ) and `changed` (at least N percent do).
+
 ## Pitfalls
 
 **G1. An image built by another Guix is a different system.** Another
