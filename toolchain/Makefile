@@ -23,7 +23,7 @@ GNUMACH_NCPUS_OPTION := $(if $(GNUMACH_NCPUS_IS_SMP),--enable-ncpus=$(GNUMACH_NC
 BINUTILS_VER := 2.46.1
 GCC_VER      := 15.3.0
 
-.PHONY: all toolchain toolchain-clean fetch binutils gcc1 gnumach gnumach-kernel glibc gcc2 mig hurd hurd-headers libpciaccess libtrivfs libirqhelp virtio-9p virtio-balloon virtio-blk 9pfs verify-vm clean tooldir 3p-pin glibc-rebuild
+.PHONY: all toolchain toolchain-clean fetch binutils gcc1 gnumach gnumach-kernel glibc gcc2 mig hurd hurd-headers libpciaccess libtrivfs libirqhelp virtio-9p virtio-balloon virtio-blk virtio-net 9pfs verify-vm clean tooldir 3p-pin glibc-rebuild
 
 # The verified 3p checkouts, pinned to exact SHAs (see
 # stuff/crosscompile_plan.md, "3p source pins"). The shared 3p checkout is
@@ -452,7 +452,7 @@ libirqhelp: hurd mig
 # 3p/hurd later); they link the cross prefix like 9pfs, plus libtrivfs and
 # libpciaccess, and stay uncommitted to the 3p trees.  VIRTIO_DIR selects
 # which checkout is built, so a workbranch can be tested in place.
-VIRTIO_DIR ?= $(HOME)/src/virtio
+VIRTIO_DIR ?= $(HOME)/src/virtio-1
 
 virtio-9p: hurd libpciaccess libtrivfs libirqhelp
 	$(MAKE) -C $(VIRTIO_DIR) clean
@@ -492,6 +492,20 @@ virtio-blk: hurd libpciaccess libirqhelp
 	@echo "=== gate: virtio-blk ==="
 	file $(VIRTIO_DIR)/virtio-blk
 	file $(VIRTIO_DIR)/vblk-client
+
+# Same build and gate shape as virtio-blk: the repo Makefile's default
+# target already builds the net driver, so this names the binary the
+# network harness installs: virtio-net (raw datapath + Mach device
+# translator).
+virtio-net: hurd libpciaccess libirqhelp
+	$(MAKE) -C $(VIRTIO_DIR) clean
+	$(MAKE) -C $(VIRTIO_DIR) \
+	    PATH=$(PREFIX)/bin:$$PATH \
+	    CC=$(PREFIX)/bin/x86_64-gnu-gcc \
+	    CPATH=$(PREFIX)/include \
+	    LIBS="shouldbeinlibc ihash ports iohelp fshelp trivfs pciaccess hurduser machuser irqhelp"
+	@echo "=== gate: virtio-net ==="
+	file $(VIRTIO_DIR)/virtio-net
 
 verify-vm: 9pfs
 	@echo "=== V2: ELF check ==="

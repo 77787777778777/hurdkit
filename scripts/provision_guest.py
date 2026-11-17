@@ -765,6 +765,16 @@ def stage_kernel(session, custom_kernel, custom_overlay):
     if not custom_kernel and not custom_overlay:
         raise GuestError("The kernel stage needs CUSTOM_KERNEL or CUSTOM_OVERLAY")
     apply_overlay(session, custom_overlay, custom_kernel)
+    # If the overlay installed virtio-net, publish /dev/vnet0 as a
+    # passive translator so it comes up at boot.
+    if custom_overlay and os.path.exists(
+            os.path.join(custom_overlay, "hurd", "virtio-net")):
+        status = session.run_command(
+            "test -x /hurd/virtio-net && "
+            "settrans -cp /dev/vnet0 /hurd/virtio-net --serve",
+            "vnet_settrans")
+        if status != 0:
+            raise GuestError("Failed to publish /dev/vnet0", 1)
 
 
 def main():

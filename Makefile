@@ -68,6 +68,8 @@ SSH_KEY_DIR   := $(IMG_DIR)/keys
 # built and tested without touching the checked-out tree.
 SHARE_DIR     := $(CURDIR)/$(IMG_DIR)/share
 VIRTIO_DIR    ?= $(HOME)/src/virtio
+VIRTIO_NET_DIR ?= $(HOME)/src/virtio-1
+VNET_IMG       ?= $(IMG_DIR)/hurd.vnet.qcow2
 VIRTIO_9P_BIN := $(VIRTIO_DIR)/virtio-9p
 # The gnumach source checkout used for the kernel build. Override this to
 # build a worktree instead of the pinned 3p checkout.
@@ -100,7 +102,8 @@ LOCK_FILE     := $(IMG_DIR)/.build.lock
 	clean distclean \
 	toolchain toolchain-clean toolchain-docker \
 	verify-vm hurd-build \
-	gnumach-kernel smp-kernel up-kernel 9pfs fetch-3p virtio-blk virtio-blk-test \
+	gnumach-kernel smp-kernel up-kernel 9pfs fetch-3p virtio-blk virtio-blk-test virtio-net virtio-net-test \
+	virtio-net-image virtio-net-connectivity-test \
 	run-smp-tests run-up-tests
 
 # The default builds the whole image pipeline, with every intermediate
@@ -324,6 +327,7 @@ up-kernel: fetch-3p ; $(MAKE) -C toolchain gnumach-kernel \
 virtio-9p: fetch-3p    ; $(MAKE) -C toolchain virtio-9p VIRTIO_DIR=$(VIRTIO_DIR)
 virtio-balloon: fetch-3p    ; $(MAKE) -C toolchain virtio-balloon VIRTIO_DIR=$(VIRTIO_DIR)
 virtio-blk: fetch-3p    ; $(MAKE) -C toolchain virtio-blk VIRTIO_DIR=$(VIRTIO_DIR)
+virtio-net: fetch-3p    ; $(MAKE) -C toolchain virtio-net VIRTIO_DIR=$(VIRTIO_NET_DIR)
 
 # Boot the guest with a host directory shared through QEMU's virtio-9p
 # device and run the translator test matrix: the device selftest, the
@@ -364,6 +368,51 @@ virtio-blk-test: virtio-blk $(TEST_IMG)
 		VIRTIO_DIR="$(VIRTIO_DIR)" MODE="$(MODE)" \
 		BASE_IMG="$(abspath $(TEST_IMG))" \
 		bash scripts/virtio_blk_test.sh
+
+# Boot the guest with QEMU's virtio-net device and run the network matrix:
+# --status, the Phase 1/2 selftest (handshake, status flavors, write
+# policy, NET_RCV_MSG delivery), the raw TX/RX traffic probe, a daemon
+# smoke test and a Mach-device translator smoke test, plus the no-device
+# negative boot (see scripts/virtio_net_test.sh).
+virtio-net-test: virtio-net $(TEST_IMG)
+	$(MKDIR_P) $(TMP_DIR)
+	SSH_HOST="$(SSH_HOST)" SSH_PORT="$(SSH_PORT)" REUSE="$(REUSE)" \
+		VIRTIO_DIR="$(VIRTIO_NET_DIR)" MODE="$(MODE)" \
+		BASE_IMG="$(abspath $(TEST_IMG))" \
+		bash scripts/virtio_net_test.sh
+
+# Build a guest image whose primary network interface is virtio-net (replacing
+# e1000): stages the virtio-net binary and a matching /etc/network/interfaces
+# into the packages image via CUSTOM_OVERLAY.
+virtio-net-image: virtio-net
+	$(MKDIR_P) $(TMP_DIR)/vnet-overlay/hurd $(TMP_DIR)/vnet-overlay/etc/network
+	cp $(VIRTIO_NET_DIR)/virtio-net $(TMP_DIR)/vnet-overlay/hurd/virtio-net
+	chmod 755 $(TMP_DIR)/vnet-overlay/hurd/virtio-net
+	printf '%s\n' \
+	  '# This file describes the network interfaces available on your system' \
+	  '# and how to activate them. For more information, see interfaces(5).' \
+	  '' \
+	  'source /etc/network/interfaces.d/*' \
+	  '' \
+	  '# The loopback network interface' \
+	  'auto lo' \
+	  'iface lo inet loopback' \
+	  '' \
+	  '# The primary network interface (virtio-net)' \
+	  'auto /dev/vnet0' \
+	  'iface /dev/vnet0 inet dhcp' \
+	  > $(TMP_DIR)/vnet-overlay/etc/network/interfaces
+	SSH_PORT="$(SSH_PORT)" $(MAKE) stage STAGE=kernel \
+		VARIANT="$(abspath $(VNET_IMG))" \
+		STAGE_INPUT="$(abspath $(TEST_IMG))" \
+		CUSTOM_OVERLAY="$(abspath $(TMP_DIR)/vnet-overlay)"
+
+# Boot the virtio-net-only image and verify end-to-end connectivity.
+virtio-net-connectivity-test: virtio-net-image
+	$(MKDIR_P) $(TMP_DIR)
+	SSH_HOST="$(SSH_HOST)" SSH_PORT="$(SSH_PORT)" REUSE="$(REUSE)" \
+		BASE_IMG="$(abspath $(VNET_IMG))" \
+		bash scripts/virtio_net_connectivity_test.sh
 
 # Boot the staged SMP kernel image (-smp 2) and run the SMP test matrix:
 # the `smp` userland command plus the in-guest pset stress binary.  The
