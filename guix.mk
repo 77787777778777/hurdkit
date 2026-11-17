@@ -91,3 +91,14 @@ guix-screenshot:
 
 stage1-check:
 	@bash scripts/stage1_check.sh
+
+# --- The Wayland guest (guix/hurd64-wayland.scm): libwayland and a
+# software Mesa. stage2-reference renders the frames on this machine only. ---
+
+.PHONY: stage2-check stage2-reference
+
+stage2-check:
+	@bash scripts/stage2_check.sh
+
+stage2-reference:
+	@bash scripts/stage2_check.sh reference

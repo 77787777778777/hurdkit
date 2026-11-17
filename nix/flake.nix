@@ -101,7 +101,10 @@
         guix = pkgs.mkShell {
           name = "hurdkit-guix";
           inputsFrom = [ self.devShells.${system}.default ];
-          packages = [ goonix.packages.${system}.default ];
+          packages = [
+            goonix.packages.${system}.default
+            pkgs.tcl # scripts/ppm_check.tcl
+          ];
         };
       };
     };
