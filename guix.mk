@@ -84,3 +84,10 @@ guix-reset-state:
 # Save the guest's screen as img/guix/screen.ppm
 guix-screenshot:
 	@$(GUIX_VM) screenshot
+
+# --- The niri platform guest (guix/hurd64-platform.scm) and its tests. ---
+
+.PHONY: stage1-check
+
+stage1-check:
+	@bash scripts/stage1_check.sh
