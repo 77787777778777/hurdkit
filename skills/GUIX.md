@@ -178,6 +178,10 @@ programs in it; `scripts/stage1_check.sh` lists them. The guest has:
   its mappings keep working. The test checks that on `/dev/shm`, and on
   ext2 as the control; it also runs on Linux. Its truncation and `msync`
   cases need `gnumach-hurdkit` (G22).
+- `hurd-epoll-shim`, the epoll, eventfd, timerfd and signalfd library for
+  the libwayland port, with its TAP suites (`hurd-epoll-shim-test-NAME`).
+  It lives in its own repository, github.com/hurdkit/hurd-epoll-shim, and
+  `(hurdkit packages base)` pins the commit.
 
 ## Pitfalls
 

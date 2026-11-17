@@ -4,6 +4,7 @@
 ;; guix/modules, as scripts/guix_vm.sh does.
 (use-modules (gnu)
              (hurdkit system)
+             (hurdkit packages base)
              (hurdkit packages hurd)
              (hurdkit packages tests))
 
@@ -13,5 +14,6 @@
 
 (operating-system
   (inherit os)
-  (packages (append (list hurdkit-tmpfs-shm)
+  (packages (append (list hurdkit-tmpfs-shm
+                          hurd-epoll-shim)
                     (operating-system-packages os))))

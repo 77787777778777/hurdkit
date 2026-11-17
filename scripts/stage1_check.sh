@@ -45,5 +45,8 @@ run_tap() {
 # tmpfs: /dev/shm is the fixed tmpfs; /tmp (ext2) is the control.
 run_tap tmpfs-shm /dev/shm 100
 run_tap tmpfs-shm /tmp 20
+for name in eventfd epoll timerfd signalfd; do
+    run_tap "hurd-epoll-shim-test-$name"
+done
 stop_guest
 exit "$status"
