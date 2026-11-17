@@ -282,6 +282,7 @@ ssh-peon:
 # The URLs match the verified checkouts.
 3P_DIR   ?= 3p
 include toolchain/pins.mk
+include guix.mk
 
 fetch-3p:
 	@set -e; \

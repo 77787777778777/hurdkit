@@ -91,6 +91,10 @@ Makefile              # image pipeline + toolchain entry points
 nix/                  # flake.nix + flake.lock (development shell)
 toolchain/            # cross toolchain orchestration (host-local and docker backends)
 scripts/              # prepare_base.sh, provision_base.sh, provision_guest.py, repair_filesystem.sh, partition.sh
+guix/                 # Guix GNU/Hurd guest: system declarations and packages
+guix.mk               # make targets of the Guix guest (guix-*)
+skills/GUIX.md        # build, run and test the Guix guest
+tests/                # TAP tests of the Guix guest scripts
 skills/BOOT.md        # detailed boot/provisioning skill
 skills/CROSS_TESTING.md  # test cross-compiled drivers inside the Hurd VM
 skills/CROSSCOMPILING.md  # cross-compiling with the toolchain (gnumach example, cross nm/objdump/readelf)
@@ -107,3 +111,11 @@ make base          # builds img/hurd.base.qcow2
 make provision     # provisions it in the VM
 make run           # boots from an overlay, SSH on 127.0.0.1:2222
 ```
+
+## Guix guest (64-bit GNU/Hurd)
+
+A second, independent guest is declared with Guix in `guix/hurd64.scm` and
+built by goonix, a Guix fork pinned in `nix/flake.lock`. It shares only the
+SSH keys in `img/keys/` with the Debian guest. Work on it inside
+`nix develop ./nix#guix`; [skills/GUIX.md](skills/GUIX.md) describes how to
+build, boot and test it.
