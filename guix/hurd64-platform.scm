@@ -6,6 +6,7 @@
              (hurdkit system)
              (hurdkit packages base)
              (hurdkit packages hurd)
+             (hurdkit packages rust)
              (hurdkit packages tests))
 
 (define os
@@ -15,5 +16,7 @@
 (operating-system
   (inherit os)
   (packages (append (list hurdkit-tmpfs-shm
-                          hurd-epoll-shim)
+                          hurd-epoll-shim
+                          hurdkit-rust-hello
+                          hurdkit-rust-evloop)
                     (operating-system-packages os))))

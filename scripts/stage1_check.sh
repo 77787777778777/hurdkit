@@ -48,5 +48,11 @@ run_tap tmpfs-shm /tmp 20
 for name in eventfd epoll timerfd signalfd; do
     run_tap "hurd-epoll-shim-test-$name"
 done
+# The hello program prints one line, not TAP.
+if [[ "$(guix_vm ssh root hurdkit-rust-hello)" != "hurdkit rust hello" ]]; then
+    echo "FAIL: hurdkit-rust-hello"
+    status=1
+fi
+run_tap hurdkit-rust-evloop
 stop_guest
 exit "$status"

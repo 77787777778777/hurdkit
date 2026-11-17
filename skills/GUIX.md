@@ -182,6 +182,9 @@ programs in it; `scripts/stage1_check.sh` lists them. The guest has:
   the libwayland port, with its TAP suites (`hurd-epoll-shim-test-NAME`).
   It lives in its own repository, github.com/hurdkit/hurd-epoll-shim, and
   `(hurdkit packages base)` pins the commit.
+- `hurdkit-rust-hello` and the `hurdkit-rust-evloop` TAP test (calloop and
+  polling on the Hurd), built by goonix's cargo build system once the Rust
+  standard library builds for the Hurd (`(hurdkit packages rust)`).
 
 ## Pitfalls
 
