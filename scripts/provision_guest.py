@@ -253,6 +253,12 @@ class GuestSession:
         connection is all that can be waited for. A guest that is still
         booting can miss the first request, so it is sent again.
         """
+        # A synced shutdown leaves fewer stale inodes for e2fsck to
+        # repair on the next stage's offline check.  `syncfs -s' also
+        # waits for the flush to land; fall back to plain `sync' when
+        # the guest's coreutils do not have it.
+        self.child.send("command -v syncfs >/dev/null && syncfs -s || sync\r")
+        self.child.expect(PROMPT, timeout=60)
         for attempt in range(attempts):
             self.child.send("poweroff\r")
             try:

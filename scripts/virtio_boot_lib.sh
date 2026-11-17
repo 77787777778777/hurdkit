@@ -26,6 +26,12 @@
 #                  anything)
 #   VT_QEMU_EXTRA  extra QEMU arguments (e.g. -machine kernel_irqchip=split)
 #   VT_E1000_ADDR  PCI slot of the e1000 (default: QEMU's next free slot)
+#   VT_NET_BACKEND NIC that carries the control netdev and the SSH forward:
+#                  e1000 (default) or virtio-net.  Only one NIC is attached
+#                  per boot: two SSH-forwarding slirp instances on one guest
+#                  (same 10.0.2.0/24) make the sshd replies race between
+#                  interfaces, so the net benchmark boots one backend per leg
+#   VT_NET_ADDR    PCI slot of the virtio-net NIC when VT_NET_BACKEND=virtio-net
 #   VT_RERUN_HINT  full "rerun ..." line printed on failure
 #
 # After vt_boot, the harness talks to the guest through VT_SSH_PORT and
@@ -59,6 +65,26 @@ vt_ssh_alive() {
         -o ConnectTimeout="${1:-5}" root@"$VT_SSH_HOST" true 2>/dev/null
 }
 
+# Control NIC: the e1000 (stock path of every other harness) or virtio-net
+# (net benchmark's virtio leg, where the driver under test must also carry
+# the SSH forward).  Both slirp instances live on 10.0.2.0/24, so attaching
+# both would give the guest two connected routes for its own replies.
+vt_net_args() {
+    case "${VT_NET_BACKEND:-e1000}" in
+        e1000)
+            printf '%s\n' \
+                "-netdev" "user,id=net0,hostfwd=tcp:$VT_SSH_HOST:$VT_SSH_PORT-:22" \
+                "-device" "e1000,netdev=net0${VT_E1000_ADDR:+,addr=$VT_E1000_ADDR}" ;;
+        virtio-net)
+            printf '%s\n' \
+                "-netdev" "user,id=net0,hostfwd=tcp:$VT_SSH_HOST:$VT_SSH_PORT-:22" \
+                "-device" "virtio-net-pci,netdev=net0,disable-legacy=off${VT_NET_ADDR:+,addr=$VT_NET_ADDR}" ;;
+        *)
+            echo "vt_net_args: unknown VT_NET_BACKEND '${VT_NET_BACKEND:-}'" >&2
+            return 1 ;;
+    esac
+}
+
 # Create the throwaway overlay the guest boots from; called once per run,
 # before the first boot (the device-less negative boot reuses it, so
 # whatever the first boot installed survives).
@@ -73,6 +99,8 @@ vt_make_overlay() {
 # device-less negative boot.  KVM is used when it is available.
 vt_boot() {
     local trace_args=()
+    local net_args
+    net_args="$(vt_net_args)" || return 1
     if [[ -n "${VT_TRACE:-}" ]]; then
         trace_args=(-trace "enable=$VT_TRACE")
     fi
@@ -94,8 +122,7 @@ vt_boot() {
         -smp 4 \
         -m "${VT_MEM_MB:-2048}M" \
         -drive file="$VT_OVERLAY",if=ide,cache=writeback \
-        -netdev user,id=net0,hostfwd=tcp:"$VT_SSH_HOST":"$VT_SSH_PORT"-:22 \
-        -device e1000,netdev=net0${VT_E1000_ADDR:+,addr="$VT_E1000_ADDR"} \
+        $net_args \
         "${trace_args[@]}" \
         ${VT_QTRACE:+-trace enable="$VT_QTRACE" -D "$VT_TMP_DIR/qtrace.log"} \
         ${VT_QEMU_EXTRA:+$VT_QEMU_EXTRA} \

@@ -14,6 +14,8 @@ IMG_URL       := https://cdimage.debian.org/cdimage/ports/latest/hurd-amd64/debi
 MD5_SUM       := 91dc71608fcfc9f237028f1fe87c39c2
 IMG_TAR       := $(IMG_DIR)/debian-hurd-amd64-$(VERSION).img.tar.xz
 RAW_IMG       := $(IMG_DIR)/debian-hurd-amd64-$(VERSION).img
+# Out-of-tree cross build directory (matches toolchain/Makefile).
+BUILD         := $(HOME)/work/x86_64-gnu-build
 # Stamp for the extraction step: the tarball preserves the member mtime,
 # which is older than the tarball itself, so the raw image would otherwise
 # be extracted again on every make invocation.
@@ -104,7 +106,8 @@ LOCK_FILE     := $(IMG_DIR)/.build.lock
 	verify-vm hurd-build \
 	gnumach-kernel smp-kernel up-kernel 9pfs fetch-3p virtio-blk virtio-blk-test virtio-net virtio-net-test \
 	virtio-net-image virtio-net-connectivity-test \
-	run-smp-tests run-up-tests
+	virtio-bench-image virtio-bench-vnet-image \
+	run-smp-tests run-up-tests virtio-bench virtio-bench-image storeio
 
 # The default builds the whole image pipeline, with every intermediate
 # exposed as its own qcow2 (see the stage rules below).
@@ -328,6 +331,7 @@ virtio-9p: fetch-3p    ; $(MAKE) -C toolchain virtio-9p VIRTIO_DIR=$(VIRTIO_DIR)
 virtio-balloon: fetch-3p    ; $(MAKE) -C toolchain virtio-balloon VIRTIO_DIR=$(VIRTIO_DIR)
 virtio-blk: fetch-3p    ; $(MAKE) -C toolchain virtio-blk VIRTIO_DIR=$(VIRTIO_DIR)
 virtio-net: fetch-3p    ; $(MAKE) -C toolchain virtio-net VIRTIO_DIR=$(VIRTIO_NET_DIR)
+storeio: fetch-3p       ; $(MAKE) -C toolchain storeio
 
 # Boot the guest with a host directory shared through QEMU's virtio-9p
 # device and run the translator test matrix: the device selftest, the
@@ -414,6 +418,57 @@ virtio-net-connectivity-test: virtio-net-image
 		BASE_IMG="$(abspath $(VNET_IMG))" \
 		bash scripts/virtio_net_connectivity_test.sh
 
+# Build a guest image carrying the hurdkit-branch gnumach (CUSTOM_KERNEL)
+# and the fixed storeio from commit e07e9590 (CUSTOM_OVERLAY).  The fixed
+# storeio is staged as /hurd/storeio-FIXED, never over /hurd/storeio: the
+# cross build runs --without-parted, so its libstore has no `part` class
+# and it cannot serve the `part:2:device:...` typed stores behind the
+# partition nodes (/dev/wd0s2) that fsck opens at boot.  The benchmark's
+# ensure_store_node uses /hurd/storeio-fixed; the Debian storeio keeps
+# serving every system node.
+virtio-bench-image: storeio gnumach-kernel virtio-9p 9pfs
+	rm -rf $(TMP_DIR)/bench-overlay
+	$(MKDIR_P) $(TMP_DIR)/bench-overlay/hurd
+	cp $(BUILD)/hurd/storeio/storeio.static $(TMP_DIR)/bench-overlay/hurd/storeio-fixed
+	chmod 755 $(TMP_DIR)/bench-overlay/hurd/storeio-fixed
+	cp $(VIRTIO_DIR)/virtio-9p $(TMP_DIR)/bench-overlay/hurd/virtio-9p
+	chmod 755 $(TMP_DIR)/bench-overlay/hurd/virtio-9p
+	cp 3p/9pfs/9pfs $(TMP_DIR)/bench-overlay/hurd/9pfs
+	chmod 755 $(TMP_DIR)/bench-overlay/hurd/9pfs
+	SSH_PORT="$(SSH_PORT)" $(MAKE) stage STAGE=kernel \
+		VARIANT="$(abspath $(IMG_DIR)/hurd.bench.qcow2)" \
+		STAGE_INPUT="$(abspath $(TEST_IMG))" \
+		CUSTOM_KERNEL="$(abspath $(BUILD)/gnumach-kernel/gnumach)" \
+		CUSTOM_OVERLAY="$(abspath $(TMP_DIR)/bench-overlay)"
+
+# Build a guest image whose only NIC is virtio-net (stages the driver and an
+# `auto /dev/vnet0` interfaces entry via CUSTOM_OVERLAY), so SSH rides on the
+# driver under test.  Used by the net-vnet leg of `make virtio-bench MODE=net`.
+virtio-bench-vnet-image: virtio-net
+	rm -rf $(TMP_DIR)/bench-vnet-overlay
+	$(MKDIR_P) $(TMP_DIR)/bench-vnet-overlay/hurd $(TMP_DIR)/bench-vnet-overlay/etc/network
+	cp $(VIRTIO_NET_DIR)/virtio-net $(TMP_DIR)/bench-vnet-overlay/hurd/virtio-net
+	chmod 755 $(TMP_DIR)/bench-vnet-overlay/hurd/virtio-net
+	printf '%s\n' \
+	  '# This file describes the network interfaces available on your system' \
+	  '# and how to activate them. For more information, see interfaces(5).' \
+	  '' \
+	  'source /etc/network/interfaces.d/*' \
+	  '' \
+	  '# The loopback network interface' \
+	  'auto lo' \
+	  'iface lo inet loopback' \
+	  '' \
+	  '# The primary network interface (virtio-net)' \
+	  'auto /dev/vnet0' \
+	  'iface /dev/vnet0 inet dhcp' \
+	  > $(TMP_DIR)/bench-vnet-overlay/etc/network/interfaces
+	SSH_PORT="$(SSH_PORT)" $(MAKE) stage STAGE=kernel \
+		VARIANT="$(abspath $(IMG_DIR)/hurd.bench-vnet.qcow2)" \
+		STAGE_INPUT="$(abspath $(TEST_IMG))" \
+		CUSTOM_KERNEL="$(abspath $(BUILD)/gnumach-kernel/gnumach)" \
+		CUSTOM_OVERLAY="$(abspath $(TMP_DIR)/bench-vnet-overlay)"
+
 # Boot the staged SMP kernel image (-smp 2) and run the SMP test matrix:
 # the `smp` userland command plus the in-guest pset stress binary.  The
 # SMP image is expected to already exist (built via `make smp-kernel
@@ -425,6 +480,18 @@ run-smp-tests:
 		GDB="$(GDB)" SMP_IMG="$(abspath $(IMG_DIR)/hurd.kernel.smp.qcow2)" \
 		SMP_CPU_COUNT="$(SMP_CPU_COUNT)" \
 		bash scripts/run_smp_tests.sh
+
+# Boot the guest and run the virtio benchmark matrix (block, filesystem, 9pfs,
+# network).  See scripts/virtio_bench.sh and stuff/benchmark_plan.md.
+# Boots hurd.bench.qcow2 (hurdkit gnumach + fixed storeio via CUSTOM_OVERLAY).
+virtio-bench: virtio-bench-image
+	$(MKDIR_P) $(TMP_DIR)
+	SSH_HOST="$(SSH_HOST)" SSH_PORT="$(SSH_PORT)" REUSE="$(REUSE)" \
+		GDB="$(GDB)" MODE="$(MODE)" BENCH_RUNS="$(BENCH_RUNS)" \
+		BENCH_JSON="$(BENCH_JSON)" RAM_MB="2048" \
+		BASE_IMG="$(abspath $(IMG_DIR)/hurd.bench.qcow2)" \
+		VIRTIO_DIR="$(VIRTIO_DIR)" VIRTIO_NET_DIR="$(VIRTIO_NET_DIR)" \
+		bash scripts/virtio_bench.sh
 
 run-up-tests:
 	$(MKDIR_P) $(TMP_DIR)
