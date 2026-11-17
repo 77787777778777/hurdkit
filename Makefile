@@ -69,6 +69,19 @@ SSH_KEY_DIR   := $(IMG_DIR)/keys
 SHARE_DIR     := $(CURDIR)/$(IMG_DIR)/share
 VIRTIO_DIR    ?= $(HOME)/src/virtio
 VIRTIO_9P_BIN := $(VIRTIO_DIR)/virtio-9p
+# The gnumach source checkout used for the kernel build. Override this to
+# build a worktree instead of the pinned 3p checkout.
+GNUMACH_DIR   ?= 3p/gnumach
+# Number of CPUs configured in the gnumach kernel.
+GNUMACH_NCPUS ?= 1
+
+# Number of vCPUs for the SMP test harness (default 2; must equal
+# GNUMACH_NCPUS for the SMP kernel build or gnumach's ACPI parse aborts).
+SMP_CPU_COUNT ?= 2
+
+# Number of vCPUs for the UP test harness (default 1; must equal
+# GNUMACH_NCPUS for the UP kernel build).
+UP_CPU_COUNT ?= 1
 
 # Toolchain
 QEMU_SYSTEM   := qemu-system-x86_64
@@ -82,7 +95,13 @@ RM            := rm -f
 LOCK          := flock
 LOCK_FILE     := $(IMG_DIR)/.build.lock
 
-.PHONY: all download check base accounts packages kernel provision stage run run-nokvm ssh ssh-peon clean distclean toolchain toolchain-clean toolchain-docker verify-vm hurd-build gnumach-kernel 9pfs fetch-3p virtio-blk virtio-blk-test
+.PHONY: all download check base accounts packages kernel provision stage \
+	run run-nokvm ssh ssh-peon \
+	clean distclean \
+	toolchain toolchain-clean toolchain-docker \
+	verify-vm hurd-build \
+	gnumach-kernel smp-kernel up-kernel 9pfs fetch-3p virtio-blk virtio-blk-test \
+	run-smp-tests run-up-tests
 
 # The default builds the whole image pipeline, with every intermediate
 # exposed as its own qcow2 (see the stage rules below).
@@ -296,7 +315,12 @@ toolchain: fetch-3p    ; $(MAKE) -C toolchain toolchain
 toolchain-clean:       ; $(MAKE) -C toolchain clean
 toolchain-docker: fetch-3p ; $(MAKE) -C toolchain toolchain BACKEND=docker
 hurd-build: fetch-3p   ; $(MAKE) -C toolchain hurd
-gnumach-kernel: fetch-3p ; $(MAKE) -C toolchain gnumach-kernel
+gnumach-kernel: fetch-3p ; $(MAKE) -C toolchain gnumach-kernel \
+	GNUMACH_DIR=$(abspath $(GNUMACH_DIR)) GNUMACH_NCPUS=$(GNUMACH_NCPUS)
+smp-kernel: fetch-3p ; $(MAKE) -C toolchain gnumach-kernel \
+	GNUMACH_DIR=$(abspath $(GNUMACH_DIR)) GNUMACH_NCPUS=2
+up-kernel: fetch-3p ; $(MAKE) -C toolchain gnumach-kernel \
+	GNUMACH_DIR=$(abspath $(GNUMACH_DIR)) GNUMACH_NCPUS=1
 9pfs: fetch-3p         ; $(MAKE) -C toolchain 9pfs
 virtio-9p: fetch-3p    ; $(MAKE) -C toolchain virtio-9p VIRTIO_DIR=$(VIRTIO_DIR)
 virtio-balloon: fetch-3p    ; $(MAKE) -C toolchain virtio-balloon VIRTIO_DIR=$(VIRTIO_DIR)
@@ -341,6 +365,26 @@ virtio-blk-test: virtio-blk $(TEST_IMG)
 		VIRTIO_DIR="$(VIRTIO_DIR)" MODE="$(MODE)" \
 		BASE_IMG="$(abspath $(TEST_IMG))" \
 		bash scripts/virtio_blk_test.sh
+
+# Boot the staged SMP kernel image (-smp 2) and run the SMP test matrix:
+# the `smp` userland command plus the in-guest pset stress binary.  The
+# SMP image is expected to already exist (built via `make smp-kernel
+# GNUMACH_NCPUS=2` + `make stage STAGE=kernel VARIANT=... CUSTOM_KERNEL=...`).
+# Pass SMP_IMG=... to boot a different image.
+run-smp-tests:
+	$(MKDIR_P) $(TMP_DIR)
+	SSH_HOST="$(SSH_HOST)" SSH_PORT="$(SSH_PORT)" REUSE="$(REUSE)" \
+		GDB="$(GDB)" SMP_IMG="$(abspath $(IMG_DIR)/hurd.kernel.smp.qcow2)" \
+		SMP_CPU_COUNT="$(SMP_CPU_COUNT)" \
+		bash scripts/run_smp_tests.sh
+
+run-up-tests:
+	$(MKDIR_P) $(TMP_DIR)
+	SSH_HOST="$(SSH_HOST)" SSH_PORT="$(SSH_PORT)" REUSE="$(REUSE)" \
+		GDB="$(GDB)" SMP_IMG="$(abspath $(IMG_DIR)/hurd.kernel.up.qcow2)" \
+		SMP_CPU_COUNT="$(UP_CPU_COUNT)" \
+		SMP_UP=1 \
+		bash scripts/run_smp_tests.sh
 verify-vm: fetch-3p    ; $(MAKE) -C toolchain verify-vm
 
 # Remove temporary overlay images
