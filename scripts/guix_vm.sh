@@ -53,10 +53,11 @@ QEMU_IMG="${QEMU_IMG:-qemu-img}"
 # minutes; raise the timeout then.
 GUIX_BOOT_TIMEOUT="${GUIX_BOOT_TIMEOUT:-180}"
 GUIX_BOOT_ATTEMPTS="${GUIX_BOOT_ATTEMPTS:-3}"
-BASE_IMG="$GUIX_DIR/hurd64.base.qcow2"
+GUIX_IMAGE_BASENAME="${GUIX_IMAGE_BASENAME:-hurd64}"
+BASE_IMG="$GUIX_DIR/$GUIX_IMAGE_BASENAME.base.qcow2"
 # A symlink into /gnu/store. It is a garbage collector root: as long as it
 # exists, "guix gc" does not delete the image that Guix built.
-STORE_LINK="$GUIX_DIR/hurd64.store-image"
+STORE_LINK="$GUIX_DIR/$GUIX_IMAGE_BASENAME.store-image"
 STATE_IMG="$GUIX_DIR/state.qcow2"
 RUN_IMG="$GUIX_DIR/tmp/run.qcow2"
 SERIAL_LOG="$GUIX_DIR/serial.log"
@@ -67,10 +68,10 @@ PID_FILE="$GUIX_DIR/qemu.pid"
 # port, so that guests of two checkouts do not collide.
 MONITOR_SOCKET="${XDG_RUNTIME_DIR:-/tmp}/hurdkit-guix-${GUIX_SSH_PORT}.monitor"
 LOCK_FILE="$GUIX_DIR/.build.lock"
-# The root filesystem of a Guix GNU/Hurd image is its only partition.
-ROOT_PARTITION=1
-# The sshd of the guest listens on this port (not 22).
-GUEST_SSH_PORT=2222
+# Image layouts and the halt marker are properties of the declared guest.
+ROOT_PARTITION="${GUIX_ROOT_PARTITION:-1}"
+GUEST_SSH_PORT="${GUIX_GUEST_SSH_PORT:-2222}"
+GUIX_GUEST_KIND="${GUIX_GUEST_KIND:-hurd}"
 
 die() {
     echo "guix_vm: $*" >&2
@@ -348,6 +349,32 @@ cmd_ssh() {
 
 cmd_stop() {
     local pid i clean=0
+    if [[ "$GUIX_GUEST_KIND" == linux ]]; then
+        guest_ssh -b root sync >/dev/null 2>&1 || true
+        # Let the guest unmount its filesystems and request ACPI power-off.
+        # QMP quit is not a graceful shutdown and must not be used first.
+        # Guix's /sbin/halt is Shepherd's halt, not util-linux's halt -p.
+        timeout --signal=TERM --kill-after=2s 15s \
+            ssh -i "$SSH_KEY_DIR/root_ed25519" -o IdentitiesOnly=yes \
+            -o IdentityAgent=none -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR \
+            -o ConnectTimeout=10 -o BatchMode=yes \
+            -p "$GUIX_SSH_PORT" "root@$SSH_HOST" \
+            'sync; herd power-off root' >/dev/null 2>&1 || true
+        for (( i = 0; i < 60; i++ )); do
+            [[ -z "$(qemu_pid)" ]] && break
+            sleep 1
+        done
+        pid="$(qemu_pid)"
+        if [[ -z "$pid" ]]; then
+            echo "guix_vm: Linux guest shut down cleanly"
+            rm -f "$RUN_IMG"
+            return 0
+        fi
+        echo "guix_vm: Linux guest did not power off; stopping QEMU" >&2
+        kill_qemu "$pid"
+        return 1
+    fi
     pid="$(qemu_pid)"
     if [[ -z "$pid" ]]; then
         echo "guix_vm: the guest is not running"
@@ -409,7 +436,11 @@ cmd_qmp() {
 
 cmd_screenshot() {
     [[ -n "$(qemu_pid)" ]] || die "the guest is not running"
-    if [[ "${GUIX_GPU:-none}" == none ]]; then
+    if [[ "$GUIX_GUEST_KIND" == linux ]]; then
+        need scp
+        need magick
+        bash "$SCRIPT_DIR/linux_screenshot.sh" "${1:-$GUIX_DIR/screen.ppm}"
+    elif [[ "${GUIX_GPU:-none}" == none ]]; then
         cmd_qmp screenshot "${1:-$GUIX_DIR/screen.ppm}"
     else
         cmd_qmp screenshot "${1:-$GUIX_DIR/screen.ppm}" gpu0 0

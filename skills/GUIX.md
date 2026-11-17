@@ -244,6 +244,28 @@ on|off PATTERN`, `execute JSON`. `scripts/ppm_check.tcl` checks screenshots:
 `dimensions`, `region` (mostly one colour), `differs` (at most N percent of
 the pixels differ) and `changed` (at least N percent do).
 
+### Linux niri reference
+
+`guix/linux-reference.scm` is an x86_64 Linux Guix system with niri, foot,
+Mesa's tools, glmark2 and the Vulkan tools, logged in as `peon` on tty1
+straight into niri. It shows what the Hurd guest should eventually do:
+
+```sh
+make linux-ref-image
+make linux-ref-start GUIX_GPU=virgl GUIX_DISPLAY=egl-headless GUIX_HOST_GPU=nvidia
+make linux-ref-screenshot
+make linux-ref-qmp GUIX_QMP_ARGS='key super+t'
+make linux-ref-stop
+```
+
+It has its own port and `img/guix-linux/`. `linux-ref-screenshot` takes the
+picture through niri's IPC, because QMP `screendump` cannot read an
+accelerated scanout. `make stage0-check` is the live gate: the Hurd guest
+boots and stops cleanly, and for each GPU in `STAGE0_GPUS` and path (virgl,
+and Venus for `STAGE0_VENUS_GPUS`) the reference reports that GPU as
+renderer, runs glmark2, takes screenshots, opens foot by QMP keys and stops
+cleanly. Artifacts go to `img/stage0/`.
+
 ## Pitfalls
 
 **G1. An image built by another Guix is a different system.** Another
@@ -357,3 +379,4 @@ when its checks pass and prints what failed otherwise.
 | The guest with Hurdkit's GNU Mach and Hurd | `GUIX_DIR=$PWD/img/guix-hurdkit GUIX_SSH_PORT=2225 GUIX_OS=$PWD/guix/hurd64-hurdkit.scm bash scripts/guix_vm.sh image`, then `start`, `ssh root ps -ef` and `stop` the same way |
 | The platform guest's tests | `make stage1-check` |
 | The Wayland guest's tests | `make stage2-check` |
+| The graphics gate | `make stage0-check` |

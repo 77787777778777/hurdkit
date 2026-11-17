@@ -6,7 +6,7 @@
 #
 # This file reads no variable of the Makefile that includes it, and runs
 # none of the Debian pipeline's scripts. Its own variables start with
-# GUIX_, so that nothing collides either.
+# GUIX_ or LINUX_REF_, so that nothing collides either.
 
 # The command that runs guix-authorize-host as root.
 GUIX_SUDO        ?= sudo
@@ -130,3 +130,39 @@ export GUIX_GPU GUIX_DISPLAY GUIX_HOST_GPU GUIX_VK_DEVICE GUIX_VENUS_MEMFD \
 # Send a QMP command to the running guest
 guix-qmp:
 	@$(GUIX_VM) qmp $(GUIX_QMP_ARGS)
+
+# --- The Linux niri reference guest (guix/linux-reference.scm): the same
+# lifecycle with its own image, directory and SSH port. ---
+
+LINUX_REF_VM = env GUIX_OS="$(abspath guix/linux-reference.scm)" \
+	GUIX_GUEST_KIND=linux GUIX_IMAGE_TYPE=qcow2 \
+	GUIX_IMAGE_BASENAME=linux-reference GUIX_IMAGE_OPTS="--image-size=8G" \
+	GUIX_DIR="$(abspath img/guix-linux)" GUIX_SSH_PORT=2224 \
+	GUIX_MEMORY=4096 GUIX_CPUS=4 GUIX_ROOT_PARTITION=2 \
+	bash scripts/guix_vm.sh
+
+.PHONY: linux-ref-image linux-ref-start linux-ref-stop linux-ref-status \
+	linux-ref-ssh linux-ref-ssh-peon linux-ref-screenshot linux-ref-qmp \
+	stage0-check
+
+linux-ref-image:
+	@$(LINUX_REF_VM) image
+linux-ref-start:
+	@$(LINUX_REF_VM) start -- $(GUIX_QEMU_ARGS)
+linux-ref-stop:
+	@$(LINUX_REF_VM) stop
+linux-ref-status:
+	@$(LINUX_REF_VM) status
+linux-ref-ssh:
+	@$(LINUX_REF_VM) ssh root $(if $(GUIX_SSH_COMMAND),"$(GUIX_SSH_COMMAND)")
+linux-ref-ssh-peon:
+	@$(LINUX_REF_VM) ssh peon $(if $(GUIX_SSH_COMMAND),"$(GUIX_SSH_COMMAND)")
+linux-ref-screenshot:
+	@$(LINUX_REF_VM) screenshot
+linux-ref-qmp:
+	@$(LINUX_REF_VM) qmp $(GUIX_QMP_ARGS)
+
+# The live graphics gate of the niri plan's stage 0 (Hurd and Linux
+# reference guests, both host GPUs; STAGE0_GPUS=nvidia for one).
+stage0-check:
+	@bash scripts/stage0_check.sh
