@@ -60,9 +60,16 @@ vt_check_pidfile() {
 }
 
 vt_ssh_alive() {
-    ssh -i "$VT_SSH_KEY" -p "$VT_SSH_PORT" -o StrictHostKeyChecking=no \
-        -o UserKnownHostsFile=/dev/null -o BatchMode=yes -o LogLevel=ERROR \
-        -o ConnectTimeout="${1:-5}" root@"$VT_SSH_HOST" true 2>/dev/null
+    local timeout="${1:-5}"
+    local out rc
+    out=$(ssh -i "$VT_SSH_KEY" -p "$VT_SSH_PORT" \
+        -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+        -o BatchMode=yes -o LogLevel=ERROR -o IdentitiesOnly=yes \
+        -o PasswordAuthentication=no \
+        -o ConnectTimeout="$timeout" root@"$VT_SSH_HOST" true 2>&1)
+    rc=$?
+    VT_SSH_LAST_ERROR="$out"
+    return $rc
 }
 
 # Control NIC: the e1000 (stock path of every other harness) or virtio-net
@@ -148,15 +155,26 @@ vt_boot() {
     # Probe with a real SSH login: QEMU binds the hostfwd port long before
     # the guest's sshd answers, so a TCP connect alone reports success
     # while the login would still race and die on a reset.
+    echo "$VT_NAME: waiting for SSH on port $VT_SSH_PORT..."
     local attempt
     for attempt in $(seq 1 "${VT_SSH_PROBE_ATTEMPTS:-120}"); do
         if vt_ssh_alive 3; then
             return 0
         fi
+        if [[ "${VT_SSH_LAST_ERROR:-}" == *"Permission denied"* ]]; then
+            echo "$VT_NAME: SSH key not authorized (Permission denied)" >&2
+            echo "  key: $VT_SSH_KEY  user: root@$VT_SSH_HOST port $VT_SSH_PORT" >&2
+            echo "  provision the accounts stage or fix SSH_KEY/SSH_KEY_DIR" >&2
+            cat "$VT_QEMU_LOG" >&2
+            return 1
+        fi
         if ! kill -0 "$VT_QEMU_PID" 2>/dev/null; then
             echo "$VT_NAME: QEMU exited during boot" >&2
             cat "$VT_QEMU_LOG" >&2
             return 1
+        fi
+        if (( attempt % 10 == 0 )); then
+            echo "$VT_NAME: still waiting for SSH (attempt $attempt/${VT_SSH_PROBE_ATTEMPTS:-120})..." >&2
         fi
         sleep 2
     done

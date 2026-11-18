@@ -35,16 +35,23 @@ if [[ ! -f "$BASE_IMG" ]]; then BASE_IMG="${REPO_ROOT}/img/hurd.packages.qcow2";
 BENCH_E1000_IMG="${BENCH_E1000_IMG:-$BASE_IMG}"
 BENCH_VNET_IMG="${BENCH_VNET_IMG:-${REPO_ROOT}/img/hurd.bench-vnet.qcow2}"
 VIRTIO_DIR="${VIRTIO_DIR:-${HOME}/src/virtio}"
-VIRTIO_NET_DIR="${VIRTIO_NET_DIR:-${HOME}/src/virtio-1}"
+VIRTIO_NET_DIR="${VIRTIO_NET_DIR:-${HOME}/src/virtio}"
 VIRTIO_BLK_BIN="${VIRTIO_BLK_BIN:-${VIRTIO_DIR}/virtio-blk}"
 VBLK_CLIENT_BIN="${VBLK_CLIENT_BIN:-${VIRTIO_DIR}/vblk-client}"
 VIRTIO_NET_BIN="${VIRTIO_NET_BIN:-${VIRTIO_NET_DIR}/virtio-net}"
 VIRTIO_NET_CLIENT_BIN="${VIRTIO_NET_CLIENT_BIN:-${VIRTIO_NET_DIR}/vnet-client}"
-VIRTIO_9P_BIN="${VIRTIO_9P_BIN:-${HOME}/src/virtio-1/virtio-9p}"
+VIRTIO_9P_BIN="${VIRTIO_9P_BIN:-${VIRTIO_DIR}/virtio-9p}"
 NINEPFS_BIN="${NINEPFS_BIN:-${REPO_ROOT}/3p/9pfs/9pfs}"
 SSH_PORT="${SSH_PORT:-2222}"
 SSH_HOST="${SSH_HOST:-127.0.0.1}"
 MODE="${MODE:-all}"
+case "$MODE" in
+    all|block|fs-tar|fs-dd|net|net-e1000|net-vnet) ;;
+    *)
+        echo "virtio-bench: unknown MODE '$MODE'" >&2
+        echo "  valid modes: all, block, fs-tar, fs-dd, net, net-e1000, net-vnet" >&2
+        exit 2 ;;
+esac
 RAM_MB="${RAM_MB:-2048}"
 BENCH_RUNS="${BENCH_RUNS:-3}"
 BENCH_JSON="${BENCH_JSON:-0}"
@@ -118,6 +125,7 @@ run_py() {
     export VIRTIO_BLK_BIN VBLK_CLIENT_BIN VIRTIO_NET_BIN VIRTIO_NET_CLIENT_BIN VIRTIO_9P_BIN NINEPFS_BIN
     export VIRTIO_DIR VIRTIO_NET_DIR
     export TMP_DIR RESULTS_DIR
+    echo "virtio-bench: applying $1 tests..." >&2
     python3 "$SCRIPT_DIR/virtio_bench.py" "$1" || FAILED=1
 }
 
@@ -164,6 +172,20 @@ else
                 fi
                 if [[ "$FAILED" -eq 1 ]]; then break; fi
             done
+            ;;
+        net-vnet)
+            VT_BASE_IMG="$BENCH_VNET_IMG"
+            VT_NET_BACKEND=virtio-net
+            vt_make_overlay
+            echo "virtio-bench: booting net-vnet leg ($VT_NET_BACKEND, $VT_BASE_IMG)..."
+            if ! vt_boot; then
+                FAILED=1
+            else
+                run_py "net-vnet"
+                if [[ "$FAILED" -eq 0 ]] && ! vt_wait_poweroff; then
+                    FAILED=1
+                fi
+            fi
             ;;
         *)
             VT_BASE_IMG="$BENCH_E1000_IMG"

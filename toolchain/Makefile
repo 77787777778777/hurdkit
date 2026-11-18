@@ -25,7 +25,12 @@ SSH_PORT ?= 2222
 BINUTILS_VER := 2.46.1
 GCC_VER      := 15.3.0
 
-.PHONY: all toolchain toolchain-clean fetch binutils gcc1 gnumach gnumach-kernel glibc gcc2 mig hurd hurd-headers libpciaccess libtrivfs libirqhelp storeio virtio-9p virtio-balloon virtio-blk virtio-net 9pfs verify-vm clean tooldir 3p-pin glibc-rebuild
+.PHONY: all toolchain toolchain-clean fetch \
+	binutils gcc1 gnumach gnumach-kernel glibc gcc2 \
+	mig hurd hurd-headers libpciaccess libtrivfs libirqhelp storeio \
+	virtio-9p virtio-balloon virtio-blk virtio-net 9pfs verify-vm \
+	clean tooldir 3p-pin glibc-rebuild \
+	virtio-clean
 
 # The verified 3p checkouts, pinned to exact SHAs (see
 # stuff/crosscompile_plan.md, "3p source pins"). The shared 3p checkout is
@@ -496,7 +501,6 @@ storeio: hurd mig
 VIRTIO_DIR ?= $(HOME)/src/virtio-1
 
 virtio-9p: hurd libpciaccess libtrivfs libirqhelp
-	$(MAKE) -C $(VIRTIO_DIR) clean
 	$(MAKE) -C $(VIRTIO_DIR) \
 	    PATH=$(PREFIX)/bin:$$PATH \
 	    CC=$(PREFIX)/bin/x86_64-gnu-gcc \
@@ -509,7 +513,6 @@ virtio-9p: hurd libpciaccess libtrivfs libirqhelp
 # daemons in one pass, so this reuses the same invocation and gates on the
 # balloon binary.
 virtio-balloon: hurd libpciaccess libirqhelp
-	$(MAKE) -C $(VIRTIO_DIR) clean
 	$(MAKE) -C $(VIRTIO_DIR) \
 	    PATH=$(PREFIX)/bin:$$PATH \
 	    CC=$(PREFIX)/bin/x86_64-gnu-gcc \
@@ -524,7 +527,6 @@ virtio-balloon: hurd libpciaccess libirqhelp
 # Mach device translator) and vblk-client (the direct-RPC harness
 # client).
 virtio-blk: hurd libpciaccess libirqhelp
-	$(MAKE) -C $(VIRTIO_DIR) clean
 	$(MAKE) -C $(VIRTIO_DIR) \
 	    PATH=$(PREFIX)/bin:$$PATH \
 	    CC=$(PREFIX)/bin/x86_64-gnu-gcc \
@@ -539,7 +541,6 @@ virtio-blk: hurd libpciaccess libirqhelp
 # network harness installs: virtio-net (raw datapath + Mach device
 # translator).
 virtio-net: hurd libpciaccess libirqhelp
-	$(MAKE) -C $(VIRTIO_DIR) clean
 	$(MAKE) -C $(VIRTIO_DIR) \
 	    PATH=$(PREFIX)/bin:$$PATH \
 	    CC=$(PREFIX)/bin/x86_64-gnu-gcc \
@@ -547,6 +548,11 @@ virtio-net: hurd libpciaccess libirqhelp
 	    LIBS="shouldbeinlibc ihash ports iohelp fshelp trivfs pciaccess hurduser machuser irqhelp"
 	@echo "=== gate: virtio-net ==="
 	file $(VIRTIO_DIR)/virtio-net
+	file $(VIRTIO_DIR)/vnet-client
+
+# Clean the virtio driver build artifacts in VIRTIO_DIR.
+virtio-clean:
+	$(MAKE) -C $(VIRTIO_DIR) clean
 
 verify-vm: 9pfs
 	@echo "=== V2: ELF check ==="

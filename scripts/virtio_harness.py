@@ -155,6 +155,13 @@ class GuestSession:
         return status, output
 
     def poweroff(self):
+        # Flush guest filesystems before poweroff so the next boot's
+        # e2fsck is clean (mirrors provision_guest.poweroff).
+        try:
+            self.child.send("command -v syncfs >/dev/null && syncfs -s || sync\r")
+            self.child.expect(PROMPT, timeout=60)
+        except Exception:  # noqa: BLE001 - sync is best effort
+            pass
         self.child.send("poweroff\r")
         try:
             self.child.expect(pexpect.EOF, timeout=120)

@@ -44,11 +44,18 @@ B1_4K_BYTES = int(os.environ.get("B1_4K_BYTES", str(32 * 1024 * 1024)))
 B1_1M_BYTES = int(os.environ.get("B1_1M_BYTES", str(128 * 1024 * 1024)))
 B3_4K_BYTES = int(os.environ.get("B3_4K_BYTES", str(32 * 1024 * 1024)))
 B3_1M_BYTES = int(os.environ.get("B3_1M_BYTES", str(64 * 1024 * 1024)))
-N1_PINGS = int(os.environ.get("N1_PINGS", "100"))
+N1_PINGS = int(os.environ.get("N1_PINGS", "20"))
 N1_BYTES = int(os.environ.get("N1_BYTES", str(64 * 1024 * 1024)))
 N1_CHUNK_BYTES = int(os.environ.get("N1_CHUNK_BYTES", str(64 * 1024)))
 
 RUN_RECORDS = []
+
+
+def progress(msg):
+    # Announce a benchmark before it runs so long-running cases (large dd,
+    # tar) are not silent.  Goes to stderr so it stays out of the stdout
+    # JSON stream and the on-disk summary files.
+    print(msg, file=sys.stderr, flush=True)
 
 
 def emit_json(case, workload, backend, op, bs_bytes, nbytes, run, warmup,
@@ -167,59 +174,82 @@ def _ssh_transfer(op, nbytes, chunk):
     "rx" pipes zeros from the host into the guest's cat.  Both network
     legs ride the NIC under test the same way, so SSH's crypto overhead
     is identical across backends and the comparison stays fair.  Returns
-    (bytes transferred, elapsed seconds)."""
+    (bytes actually transferred, elapsed seconds, error detail or None)."""
     count = nbytes // chunk
     cmd = ["ssh", "-o", "BatchMode=yes", "-i", vh.SSH_KEY,
            "-p", str(vh.SSH_PORT), f"root@{vh.SSH_HOST}"]
     if op == "tx":
         cmd.append(f"dd if=/dev/zero bs={chunk} count={count} 2>/dev/null")
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                                stderr=subprocess.DEVNULL)
+                                stderr=subprocess.PIPE)
         t0 = time.monotonic()
         got = len(proc.stdout.read())
+        err = proc.stderr.read().decode(errors="replace").strip()
         dt = time.monotonic() - t0
-        proc.wait()
+        rc = proc.wait()
+        detail = None if rc == 0 else f"ssh rc={rc} err={err!r}"
     else:
         cmd.append("cat > /dev/null")
         proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
                                 stdout=subprocess.DEVNULL,
-                                stderr=subprocess.DEVNULL)
+                                stderr=subprocess.PIPE)
         payload = bytes(chunk)
+        got = 0
         t0 = time.monotonic()
+        detail = None
         for _ in range(count):
-            proc.stdin.write(payload)
-        proc.stdin.close()
-        proc.wait()
+            try:
+                proc.stdin.write(payload)
+                got += chunk
+            except BrokenPipeError:
+                detail = "broken pipe writing to ssh stdin"
+                break
+        try:
+            proc.stdin.close()
+        except BrokenPipeError:
+            if detail is None:
+                detail = "broken pipe closing ssh stdin"
         dt = time.monotonic() - t0
-        got = nbytes
-    return got, dt
+        rc = proc.wait()
+        err = proc.stderr.read().decode(errors="replace").strip()
+        if detail is None and rc != 0:
+            detail = f"ssh rc={rc} err={err!r}"
+    return got, dt, detail
 
 
 def run_net_throughput(session, backend):
     for op in ("tx", "rx"):
         case = f"N1-{backend}-{op}-{bs_name(N1_CHUNK_BYTES)}"
+        progress(f"virtio-bench: applying {case}")
         # warm-up: a small transfer so the first timed run doesn't pay
         # the connection setup
         _ssh_transfer(op, min(N1_BYTES, 1024 * 1024), N1_CHUNK_BYTES)
         for run in range(1, BENCH_RUNS + 1):
-            got, dt = _ssh_transfer(op, N1_BYTES, N1_CHUNK_BYTES)
+            got, dt, detail = _ssh_transfer(op, N1_BYTES, N1_CHUNK_BYTES)
             passed = got == N1_BYTES and dt > 0
             rate = (N1_BYTES / (1024 * 1024)) / dt if dt > 0 else 0.0
+            notes = f"{got} bytes in {dt:.2f}s"
+            if detail:
+                notes += f"; {detail}"
+            if not passed:
+                progress(f"virtio-bench: {case} run={run} got={got} "
+                         f"expected={N1_BYTES} dt={dt:.2f}s detail={detail}")
             emit_json(case, "N1", backend, op, N1_CHUNK_BYTES, N1_BYTES,
                       run, False, passed, dt * 1000.0, rate, "MiB/s",
                       f"dd bs={N1_CHUNK_BYTES} over ssh ({op})",
-                      f"{got} bytes in {dt:.2f}s")
+                      notes)
 
 
 def run_net_ping(session, case, backend):
+    progress(f"virtio-bench: applying {case}")
     t0 = time.monotonic()
-    status, out = session.run(f"ping -c {N1_PINGS} 10.0.2.2",
+    status, out = session.run(f"ping -c {N1_PINGS} -i 0.1 10.0.2.2",
                               timeout=vh.LONG_TIMEOUT)
     dt = time.monotonic() - t0
     emit_json(case, "N1", backend, "latency", 0, N1_PINGS, 1, False,
               status == 0, dt * 1000.0,
               (N1_PINGS / dt) if dt > 0 else 0.0, "pps",
-              f"ping -c {N1_PINGS} 10.0.2.2",
+              f"ping -c {N1_PINGS} -i 0.1 10.0.2.2",
               out.strip().splitlines()[-1] if out.strip() else "")
 
 
@@ -254,6 +284,7 @@ def run_dd_case(session, case, workload, backend, target, bs, nbytes, write,
                 cleanup=True):
     count = nbytes // bs
     cmd = dd_command(target, bs, count, write)
+    progress(f"virtio-bench: applying {case}")
     # warmup
     status, out, dt = timed(session, cmd)
     passed = (status == 0)
@@ -337,6 +368,7 @@ def ordinary_node_setup(session):
 
 
 def run_block(session):
+    progress("virtio-bench: applying B1 block tests")
     install_binaries(session)
     vblk_node = setup_virtio_blk(session)
     ordinary_node = ordinary_node_setup(session)
@@ -355,6 +387,7 @@ def run_block(session):
 
 
 def run_fs_dd(session):
+    progress("virtio-bench: applying B3 filesystem dd tests")
     install_binaries(session)
     mnt9 = setup_9p(session)
     mnt_ext, ext_node = setup_ext2(session)
@@ -376,6 +409,7 @@ def run_fs_dd(session):
 
 
 def run_fs_tar(session):
+    progress("virtio-bench: applying B2 filesystem tar tests")
     install_binaries(session)
     mnt9 = setup_9p(session)
     mnt_ext, ext_node = setup_ext2(session)
@@ -411,6 +445,7 @@ def run_fs_tar(session):
         dt = time.monotonic() - t0
         # We'll instead time copying corpus into target FS.
         # Re-time: create tar on target
+        progress(f"virtio-bench: applying B2-{backend}-tar-create")
         t0 = time.monotonic()
         status, out = session.run(f"tar -cf {mnt}/bench.tar -C {corpus} .",
                                  timeout=vh.LONG_TIMEOUT)
@@ -419,6 +454,7 @@ def run_fs_tar(session):
                   0, 0, 1, False, status == 0, dt * 1000.0, 0.0, "ms",
                   f"tar -cf {mnt}/bench.tar -C {corpus} .", out.strip()[-100:])
         # extract
+        progress(f"virtio-bench: applying B2-{backend}-tar-extract")
         t0 = time.monotonic()
         status, out = session.run(f"rm -rf {dest} && mkdir -p {dest} && "
                                  f"tar --no-same-owner -xf {mnt}/bench.tar -C {dest}",
@@ -430,6 +466,7 @@ def run_fs_tar(session):
 
 
 def run_net(session):
+    progress("virtio-bench: applying N1 network tests")
     install_binaries(session)
     if MODE in ("net-e1000", "all"):
         # "all" runs only the e1000 leg in this boot; the virtio-net leg

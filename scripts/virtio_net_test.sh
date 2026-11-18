@@ -41,8 +41,8 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 BASE_IMG="${BASE_IMG:-${REPO_ROOT}/img/hurd.packages.qcow2}"
 VIRTIO_DIR="${VIRTIO_DIR:-${HOME}/src/virtio}"
 # Prefer the virtio-net branch when it is available.
-if [[ ! -f "${VIRTIO_DIR}/virtio-net" && -f "${HOME}/src/virtio-1/virtio-net" ]]; then
-    VIRTIO_DIR="${HOME}/src/virtio-1"
+if [[ ! -f "${VIRTIO_DIR}/virtio-net" && -f "${HOME}/src/virtio/virtio-net" ]]; then
+    VIRTIO_DIR="${HOME}/src/virtio"
 fi
 VIRTIO_NET_BIN="${VIRTIO_NET_BIN:-${VIRTIO_DIR}/virtio-net}"
 VIRTIO_NET_CLIENT_BIN="${VIRTIO_NET_CLIENT_BIN:-${VIRTIO_DIR}/vnet-client}"
