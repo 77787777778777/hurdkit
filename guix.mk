@@ -91,3 +91,24 @@ guix-screenshot:
 
 stage1-check:
 	@bash scripts/stage1_check.sh
+
+# --- Driver tests in a separate, disposable guest (guix/hurd64-drivers.scm,
+# img/guix-drivers/). The drivers and the test matrices are Guix packages
+# at pinned commits ((hurdkit packages virtio)); the scripts of the working
+# tree are not used. REUSE=1 reruns a matrix on the guest that a failed run
+# left running. ---
+
+.PHONY: guix-virtio-test guix-virtio-balloon-test guix-virtio-blk-test \
+	guix-virtio-net-test
+
+guix-virtio-test:
+	@bash scripts/guix_virtio_test.sh 9p
+
+guix-virtio-balloon-test:
+	@bash scripts/guix_virtio_test.sh balloon
+
+guix-virtio-blk-test:
+	@bash scripts/guix_virtio_test.sh blk
+
+guix-virtio-net-test:
+	@bash scripts/guix_virtio_test.sh net

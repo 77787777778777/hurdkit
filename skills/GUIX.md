@@ -179,6 +179,28 @@ programs in it; `scripts/stage1_check.sh` lists them. The guest has:
   ext2 as the control; it also runs on Linux. Its truncation and `msync`
   cases need `gnumach-hurdkit` (G22).
 
+### Driver tests
+
+```sh
+make guix-virtio-test          # virtio-9p and 9pfs
+make guix-virtio-balloon-test
+make guix-virtio-blk-test
+make guix-virtio-net-test      # a second card; SSH stays on the e1000
+```
+
+Each target runs one test matrix of Hurdkit's virtio drivers against a
+separate, disposable guest (`guix/hurd64-drivers.scm`, `img/guix-drivers/`).
+Drivers and matrices are Guix packages of `(hurdkit packages virtio)` at
+pinned commits: `scripts/guix_virtio_test.sh` runs that snapshot of the
+matrices and never the scripts of the working tree, so work on those cannot
+break these targets. To test newer drivers or matrices, move the pins in
+the module and adapt `guix_virtio_test.sh` to what the new matrices expect;
+`VIRTIO_SRC=DIR` and `VIRTIO_MATRICES=DIR` try a local checkout first.
+
+After a passing matrix the guest has to shut down cleanly. A failed matrix
+leaves the guest running and prints how to reach it; `REUSE=1` runs the
+matrix again on that guest.
+
 ## Pitfalls
 
 **G1. An image built by another Guix is a different system.** Another
@@ -264,6 +286,13 @@ first. A link renamed after the build no longer protects the image.
 **G19. A Unix socket path has at most 107 bytes.** The sockets that talk
 to QEMU therefore live in `$XDG_RUNTIME_DIR`, named after the SSH port.
 
+**G20. After 9pfs has been used, `halt` may not finish.** In guests in
+which a 9pfs translator ran, sshd stops on `halt` but GNU Mach's shutdown
+marker often never comes, also after `settrans -g`. The cause is not known.
+`guix_vm.sh stop` then stops QEMU and exits nonzero, so `make
+guix-virtio-test` fails at that point even when its matrix passed; with a
+kept state, run `make guix-repair` before the next persistent boot.
+
 **G22. The guest has no swap.** Pages that GNU Mach evicts under memory
 pressure go to the default pager, which has nowhere to write them: the
 serial log shows `(default pager): data_return write error, losing data`,
@@ -291,3 +320,4 @@ when its checks pass and prints what failed otherwise.
 | The guest boots, answers and halts | `make guix-image guix-start guix-ssh-peon guix-stop` |
 | The guest with Hurdkit's GNU Mach and Hurd | `GUIX_DIR=$PWD/img/guix-hurdkit GUIX_SSH_PORT=2225 GUIX_OS=$PWD/guix/hurd64-hurdkit.scm bash scripts/guix_vm.sh image`, then `start`, `ssh root ps -ef` and `stop` the same way |
 | The platform guest's tests | `make stage1-check` |
+| The driver matrices | `make guix-virtio-test guix-virtio-balloon-test guix-virtio-blk-test guix-virtio-net-test` (see G20 for the first) |
