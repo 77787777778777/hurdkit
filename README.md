@@ -104,6 +104,41 @@ img/                  # downloaded image, base image, keys (git ignored)
 
 See `toolchain/README.md` for toolchain build details, `skills/BOOT.md` for the boot/provisioning procedure, `skills/CROSSCOMPILING.md` for cross-compiling (including the gnumach kernel and the cross `nm`/`objdump`/`readelf` workflow), and `skills/CROSS_TESTING.md` for testing cross-compiled drivers in the guest.
 
+## Benchmarks
+
+Run the virtio benchmark matrix (raw block I/O, filesystem dd, tar create/extract, network):
+
+```sh
+make virtio-bench            # all legs
+MODE=block make virtio-bench # block only; also fs-tar, fs-dd, net, net-e1000, net-vnet
+```
+
+Results are written as JSON to `img/tmp/virtio-bench-summary*.json`. Use `REUSE=1` to rerun against an already-booted guest.
+
+Override source locations for a workbranch (use absolute paths; `~` is not expanded):
+
+```sh
+make virtio-bench GNUMACH_DIR=/path/to/gnumach \
+  VIRTIO_DIR=/path/to/virtio VIRTIO_NET_DIR=/path/to/virtio
+```
+Defaults: `GNUMACH_DIR=3p/gnumach`, `VIRTIO_DIR=$(HOME)/src/virtio` (and `VIRTIO_NET_DIR` defaults to `VIRTIO_DIR`).
+
+SMP stress tests (build an SMP kernel first with `make smp-kernel GNUMACH_NCPUS=2`):
+
+```sh
+make smp-image        # build hurd.kernel.smp.qcow2
+make run-smp-tests    # SMP kernel, 2 vCPUs
+make up-image         # build hurd.kernel.up.qcow2
+make run-up-tests     # UP kernel, 1 vCPU
+
+Use a custom gnumach checkout/branch with `GNUMACH_DIR=/path/to/gnumach`
+(e.g. `make smp-kernel smp-image run-smp-tests GNUMACH_DIR=/path/to/gnumach`).
+```
+
+
+SMP results are written to `img/tmp/results/smp-*.log`.
+
+
 ## Quick start
 
 ```sh

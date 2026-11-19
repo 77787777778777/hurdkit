@@ -9,11 +9,14 @@
 VERSION       := 20260314
 
 # Configuration
+REPO_ROOT     ?= $(CURDIR)
 IMG_DIR       := img
 IMG_URL       := https://cdimage.debian.org/cdimage/ports/latest/hurd-amd64/debian-hurd-amd64-$(VERSION).img.tar.xz
 MD5_SUM       := 91dc71608fcfc9f237028f1fe87c39c2
 IMG_TAR       := $(IMG_DIR)/debian-hurd-amd64-$(VERSION).img.tar.xz
 RAW_IMG       := $(IMG_DIR)/debian-hurd-amd64-$(VERSION).img
+# Out-of-tree cross build directory (matches toolchain/Makefile).
+BUILD         := $(HOME)/work/x86_64-gnu-build
 # Stamp for the extraction step: the tarball preserves the member mtime,
 # which is older than the tarball itself, so the raw image would otherwise
 # be extracted again on every make invocation.
@@ -64,10 +67,12 @@ CUSTOM_OVERLAY ?=
 SSH_KEY_DIR   := $(IMG_DIR)/keys
 # The host directory shared with the guest through virtio-9p, and the
 # standalone repo of the virtio drivers (translator and daemons).
-# VIRTIO_DIR is overridable so a workbranch (e.g. ~/src/virtio-1) can be
+# VIRTIO_DIR is overridable so a workbranch (e.g. ~/src/virtio) can be
 # built and tested without touching the checked-out tree.
 SHARE_DIR     := $(CURDIR)/$(IMG_DIR)/share
 VIRTIO_DIR    ?= $(HOME)/src/virtio
+VIRTIO_NET_DIR ?= $(VIRTIO_DIR)
+VNET_IMG       ?= $(IMG_DIR)/hurd.vnet.qcow2
 VIRTIO_9P_BIN := $(VIRTIO_DIR)/virtio-9p
 # The gnumach source checkout used for the kernel build. Override this to
 # build a worktree instead of the pinned 3p checkout.
@@ -95,13 +100,17 @@ RM            := rm -f
 LOCK          := flock
 LOCK_FILE     := $(IMG_DIR)/.build.lock
 
-.PHONY: all download check base accounts packages kernel provision stage \
-	run run-nokvm ssh ssh-peon \
-	clean distclean \
-	toolchain toolchain-clean toolchain-docker \
-	verify-vm hurd-build \
-	gnumach-kernel smp-kernel up-kernel 9pfs fetch-3p virtio-blk virtio-blk-test \
-	run-smp-tests run-up-tests
+.PHONY: all download check base accounts packages kernel provision stage
+.PHONY: run run-nokvm ssh ssh-peon
+.PHONY: clean distclean clean-images rebuild
+.PHONY: toolchain toolchain-clean toolchain-docker
+.PHONY: verify-vm hurd-build
+.PHONY: gnumach-kernel smp-kernel up-kernel 9pfs fetch-3p
+.PHONY: virtio-blk virtio-blk-test virtio-net virtio-net-test
+.PHONY: virtio-net-image virtio-net-connectivity-test
+.PHONY: virtio-bench-image virtio-bench-vnet-image virtio-bench
+.PHONY: run-smp-tests run-up-tests smp-image up-image
+.PHONY: virtio-clean gnumach-clean
 
 # The default builds the whole image pipeline, with every intermediate
 # exposed as its own qcow2 (see the stage rules below).
@@ -169,6 +178,9 @@ provision: accounts packages
 # stage is the output of the previous one (see the chain rules below), and a
 # one-off input does not have a rule. The stage script checks that it exists.
 stage:
+	@if [ ! -f "$(STAGE_INPUT)" ]; then \
+		echo "stage: STAGE_INPUT not found: $(STAGE_INPUT)" >&2; exit 1; \
+	fi
 	@$(MKDIR_P) $(IMG_DIR)
 	@$(LOCK) $(LOCK_FILE) env ROOT_PASSWORD=$(ROOT_PASSWORD) \
 		CPU_COUNT=$(CPU_COUNT) MEMORY=$(MEMORY) \
@@ -192,7 +204,14 @@ STAGE_ENV = ROOT_PASSWORD=$(ROOT_PASSWORD) \
 		GUEST_PACKAGES="$(GUEST_PACKAGES)" \
 		SSH_KEY_DIR="$(abspath $(SSH_KEY_DIR))"
 
-$(IMG_DIR)/hurd.accounts.qcow2: $(BASE_IMG) scripts/provision_stage.sh scripts/provision_guest.py
+$(SSH_KEY_DIR)/%_ed25519:
+	@mkdir -p $(SSH_KEY_DIR)
+	ssh-keygen -t ed25519 -N '' -f $@ -C '$*@hurd' >/dev/null
+
+$(SSH_KEY_DIR)/%_ed25519.pub: $(SSH_KEY_DIR)/%_ed25519
+	@test -f $@ || ssh-keygen -y -f $< > $@
+
+$(IMG_DIR)/hurd.accounts.qcow2: $(BASE_IMG) scripts/provision_stage.sh scripts/provision_guest.py $(SSH_KEY_DIR)/root_ed25519 $(SSH_KEY_DIR)/root_ed25519.pub $(SSH_KEY_DIR)/peon_ed25519 $(SSH_KEY_DIR)/peon_ed25519.pub
 	@$(LOCK) $(LOCK_FILE) env $(STAGE_ENV) \
 		bash scripts/provision_stage.sh accounts $(abspath $<) $(abspath $@) $(SSH_PORT)
 
@@ -317,6 +336,7 @@ toolchain-docker: fetch-3p ; $(MAKE) -C toolchain toolchain BACKEND=docker
 hurd-build: fetch-3p   ; $(MAKE) -C toolchain hurd
 gnumach-kernel: fetch-3p ; $(MAKE) -C toolchain gnumach-kernel \
 	GNUMACH_DIR=$(abspath $(GNUMACH_DIR)) GNUMACH_NCPUS=$(GNUMACH_NCPUS)
+gnumach-clean: ; $(RM) -r $(BUILD)/gnumach-kernel $(BUILD)/gnumach-kernel-src
 smp-kernel: fetch-3p ; $(MAKE) -C toolchain gnumach-kernel \
 	GNUMACH_DIR=$(abspath $(GNUMACH_DIR)) GNUMACH_NCPUS=2
 up-kernel: fetch-3p ; $(MAKE) -C toolchain gnumach-kernel \
@@ -325,6 +345,9 @@ up-kernel: fetch-3p ; $(MAKE) -C toolchain gnumach-kernel \
 virtio-9p: fetch-3p    ; $(MAKE) -C toolchain virtio-9p VIRTIO_DIR=$(VIRTIO_DIR)
 virtio-balloon: fetch-3p    ; $(MAKE) -C toolchain virtio-balloon VIRTIO_DIR=$(VIRTIO_DIR)
 virtio-blk: fetch-3p    ; $(MAKE) -C toolchain virtio-blk VIRTIO_DIR=$(VIRTIO_DIR)
+virtio-net: fetch-3p    ; $(MAKE) -C toolchain virtio-net VIRTIO_DIR=$(VIRTIO_NET_DIR)
+virtio-clean: fetch-3p ; $(MAKE) -C toolchain virtio-clean VIRTIO_DIR=$(VIRTIO_DIR)
+storeio: fetch-3p       ; $(MAKE) -C toolchain storeio
 
 # Boot the guest with a host directory shared through QEMU's virtio-9p
 # device and run the translator test matrix: the device selftest, the
@@ -366,19 +389,192 @@ virtio-blk-test: virtio-blk $(TEST_IMG)
 		BASE_IMG="$(abspath $(TEST_IMG))" \
 		bash scripts/virtio_blk_test.sh
 
+# Boot the guest with QEMU's virtio-net device and run the network matrix:
+# --status, the Phase 1/2 selftest (handshake, status flavors, write
+# policy, NET_RCV_MSG delivery), the raw TX/RX traffic probe, a daemon
+# smoke test and a Mach-device translator smoke test, plus the no-device
+# negative boot (see scripts/virtio_net_test.sh).
+virtio-net-test: virtio-net $(TEST_IMG)
+	$(MKDIR_P) $(TMP_DIR)
+	SSH_HOST="$(SSH_HOST)" SSH_PORT="$(SSH_PORT)" REUSE="$(REUSE)" \
+		VIRTIO_DIR="$(VIRTIO_NET_DIR)" MODE="$(MODE)" \
+		BASE_IMG="$(abspath $(TEST_IMG))" \
+		bash scripts/virtio_net_test.sh
+
+# Build a guest image whose primary network interface is virtio-net (replacing
+# e1000): stages the virtio-net binary and a matching /etc/network/interfaces
+# into the packages image via CUSTOM_OVERLAY.
+virtio-net-image: virtio-net $(TEST_IMG)
+	$(MKDIR_P) $(TMP_DIR)/vnet-overlay/hurd $(TMP_DIR)/vnet-overlay/etc/network
+	cp $(VIRTIO_NET_DIR)/virtio-net $(TMP_DIR)/vnet-overlay/hurd/virtio-net
+	chmod 755 $(TMP_DIR)/vnet-overlay/hurd/virtio-net
+	printf '%s\n' \
+	  '# This file describes the network interfaces available on your system' \
+	  '# and how to activate them. For more information, see interfaces(5).' \
+	  '' \
+	  '# The loopback network interface' \
+	  'auto lo' \
+	  'iface lo inet loopback' \
+	  '' \
+	  '# The primary network interface (virtio-net)' \
+	  'auto /dev/vnet0' \
+	  'iface /dev/vnet0 inet dhcp' \
+	  > $(TMP_DIR)/vnet-overlay/etc/network/interfaces
+	@printf '%s\n' '#!/bin/sh' 'pkill -f netdde 2>/dev/null || true' > $(TMP_DIR)/vnet-overlay/etc/rc.local
+	@chmod 755 $(TMP_DIR)/vnet-overlay/etc/rc.local
+	@printf '%s\n' '#!/bin/sh' 'exit 0' > $(TMP_DIR)/vnet-overlay/hurd/netdde
+	@chmod 755 $(TMP_DIR)/vnet-overlay/hurd/netdde
+	SSH_PORT="$(SSH_PORT)" $(MAKE) stage STAGE=kernel \
+		VARIANT="$(abspath $(VNET_IMG))" \
+		STAGE_INPUT="$(abspath $(TEST_IMG))" \
+		CUSTOM_OVERLAY="$(abspath $(TMP_DIR)/vnet-overlay)"
+
+# Boot the virtio-net-only image and verify end-to-end connectivity.
+virtio-net-connectivity-test: virtio-net-image
+	$(MKDIR_P) $(TMP_DIR)
+	SSH_HOST="$(SSH_HOST)" SSH_PORT="$(SSH_PORT)" REUSE="$(REUSE)" \
+		BASE_IMG="$(abspath $(VNET_IMG))" \
+		bash scripts/virtio_net_connectivity_test.sh
+
+# Build a guest image carrying the hurdkit-branch gnumach (CUSTOM_KERNEL)
+# and the fixed storeio from commit e07e9590 (CUSTOM_OVERLAY).  The fixed
+# storeio is staged as /hurd/storeio-FIXED, never over /hurd/storeio: the
+# cross build runs --without-parted, so its libstore has no `part` class
+# and it cannot serve the `part:2:device:...` typed stores behind the
+# partition nodes (/dev/wd0s2) that fsck opens at boot.  The benchmark's
+# ensure_store_node uses /hurd/storeio-fixed; the Debian storeio keeps
+# serving every system node.
+virtio-bench-image: $(IMG_DIR)/hurd.bench.qcow2
+
+$(IMG_DIR)/hurd.bench.qcow2: $(TEST_IMG) scripts/provision_stage.sh scripts/provision_guest.py $(BUILD)/hurd/storeio/storeio.static $(VIRTIO_DIR)/virtio-9p 3p/9pfs/9pfs $(BUILD)/gnumach-kernel/gnumach
+	rm -rf $(TMP_DIR)/bench-overlay
+	$(MKDIR_P) $(TMP_DIR)/bench-overlay/hurd
+	cp $(BUILD)/hurd/storeio/storeio.static $(TMP_DIR)/bench-overlay/hurd/storeio-fixed
+	chmod 755 $(TMP_DIR)/bench-overlay/hurd/storeio-fixed
+	cp $(VIRTIO_DIR)/virtio-9p $(TMP_DIR)/bench-overlay/hurd/virtio-9p
+	chmod 755 $(TMP_DIR)/bench-overlay/hurd/virtio-9p
+	cp 3p/9pfs/9pfs $(TMP_DIR)/bench-overlay/hurd/9pfs
+	chmod 755 $(TMP_DIR)/bench-overlay/hurd/9pfs
+	SSH_PORT="$(SSH_PORT)" $(MAKE) stage STAGE=kernel \
+		VARIANT="$(abspath $@)" \
+		STAGE_INPUT="$(abspath $(TEST_IMG))" \
+		CUSTOM_KERNEL="$(abspath $(BUILD)/gnumach-kernel/gnumach)" \
+		CUSTOM_OVERLAY="$(abspath $(TMP_DIR)/bench-overlay)"
+
+# Build a guest image whose only NIC is virtio-net (stages the driver and an
+# `auto /dev/vnet0` interfaces entry via CUSTOM_OVERLAY), so SSH rides on the
+# driver under test.  Used by the net-vnet leg of `make virtio-bench MODE=net`.
+virtio-bench-vnet-image: $(IMG_DIR)/hurd.bench-vnet.qcow2
+
+$(IMG_DIR)/hurd.bench-vnet.qcow2: $(TEST_IMG) scripts/provision_stage.sh scripts/provision_guest.py $(VIRTIO_NET_DIR)/virtio-net $(BUILD)/gnumach-kernel/gnumach
+	rm -rf $(TMP_DIR)/bench-vnet-overlay
+	$(MKDIR_P) $(TMP_DIR)/bench-vnet-overlay/hurd $(TMP_DIR)/bench-vnet-overlay/etc/network
+	cp $(VIRTIO_NET_DIR)/virtio-net $(TMP_DIR)/bench-vnet-overlay/hurd/virtio-net
+	chmod 755 $(TMP_DIR)/bench-vnet-overlay/hurd/virtio-net
+	printf '%s\n' \
+	  '# This file describes the network interfaces available on your system' \
+	  '# and how to activate them. For more information, see interfaces(5).' \
+	  '' \
+	  '# The loopback network interface' \
+	  'auto lo' \
+	  'iface lo inet loopback' \
+	  '' \
+	  '# The primary network interface (virtio-net)' \
+	  'auto /dev/vnet0' \
+	  'iface /dev/vnet0 inet dhcp' \
+	  > $(TMP_DIR)/bench-vnet-overlay/etc/network/interfaces
+	@printf '%s\n' '#!/bin/sh' 'pkill -f netdde 2>/dev/null || true' > $(TMP_DIR)/bench-vnet-overlay/etc/rc.local
+	@chmod 755 $(TMP_DIR)/bench-vnet-overlay/etc/rc.local
+	@printf '%s\n' '#!/bin/sh' 'exit 0' > $(TMP_DIR)/bench-vnet-overlay/hurd/netdde
+	@chmod 755 $(TMP_DIR)/bench-vnet-overlay/hurd/netdde
+	SSH_PORT="$(SSH_PORT)" $(MAKE) stage STAGE=kernel \
+		VARIANT="$(abspath $@)" \
+		STAGE_INPUT="$(abspath $(TEST_IMG))" \
+		CUSTOM_KERNEL="$(abspath $(BUILD)/gnumach-kernel/gnumach)" \
+		CUSTOM_OVERLAY="$(abspath $(TMP_DIR)/bench-vnet-overlay)"
+
+# Build the cross-compiled artifacts on demand (only if missing) without
+# forcing a full rebuild of the phony toolchain targets on every make run.
+$(BUILD)/hurd/storeio/storeio.static:
+	$(MAKE) -C toolchain storeio
+
+$(VIRTIO_DIR)/virtio-9p:
+	$(MAKE) -C toolchain virtio-9p VIRTIO_DIR=$(VIRTIO_DIR)
+
+3p/9pfs/9pfs:
+	$(MAKE) -C toolchain 9pfs
+
+# Track the gnumach source tree so edits trigger a rebuild (the build copies
+# the tree, so a plain directory mtime is not enough).
+GNUMACH_SOURCES := $(shell find $(GNUMACH_DIR) -type f 2>/dev/null)
+$(BUILD)/gnumach-kernel/gnumach: $(GNUMACH_SOURCES)
+	$(MAKE) -C toolchain gnumach-kernel GNUMACH_NCPUS=$(GNUMACH_NCPUS)
+
+$(VIRTIO_NET_DIR)/virtio-net:
+	$(MAKE) -C toolchain virtio-net VIRTIO_DIR=$(VIRTIO_NET_DIR)
+
+$(VIRTIO_DIR)/virtio-blk:
+	$(MAKE) -C toolchain virtio-blk VIRTIO_DIR=$(VIRTIO_DIR)
+
+# Build the SMP kernel image (-smp 2): gnumach with GNUMACH_NCPUS=2 staged
+# into hurd.kernel.smp.qcow2 on top of the packages image.  Run this before
+# `make run-smp-tests`.
+smp-image: smp-kernel
+	$(MKDIR_P) $(TMP_DIR)
+	SSH_PORT="$(SSH_PORT)" $(MAKE) stage STAGE=kernel \
+		VARIANT="$(abspath $(IMG_DIR)/hurd.kernel.smp.qcow2)" \
+		STAGE_INPUT="$(abspath $(TEST_IMG))" \
+		CUSTOM_KERNEL="$(abspath $(BUILD)/gnumach-kernel/gnumach)"
+
+# Build the UP kernel image (-smp 1): gnumach with GNUMACH_NCPUS=1 staged
+# into hurd.kernel.up.qcow2 on top of the packages image.  Run this before
+# `make run-up-tests`.
+up-image: up-kernel
+	$(MKDIR_P) $(TMP_DIR)
+	SSH_PORT="$(SSH_PORT)" $(MAKE) stage STAGE=kernel \
+		VARIANT="$(abspath $(IMG_DIR)/hurd.kernel.up.qcow2)" \
+		STAGE_INPUT="$(abspath $(TEST_IMG))" \
+		CUSTOM_KERNEL="$(abspath $(BUILD)/gnumach-kernel/gnumach)"
+
 # Boot the staged SMP kernel image (-smp 2) and run the SMP test matrix:
 # the `smp` userland command plus the in-guest pset stress binary.  The
 # SMP image is expected to already exist (built via `make smp-kernel
 # GNUMACH_NCPUS=2` + `make stage STAGE=kernel VARIANT=... CUSTOM_KERNEL=...`).
 # Pass SMP_IMG=... to boot a different image.
 run-smp-tests:
+	@if [ ! -f "$(IMG_DIR)/hurd.kernel.smp.qcow2" ]; then \
+		echo "run-smp-tests: missing $(IMG_DIR)/hurd.kernel.smp.qcow2" >&2; \
+		echo "  build it with: make smp-image" >&2; exit 1; \
+	fi
 	$(MKDIR_P) $(TMP_DIR)
 	SSH_HOST="$(SSH_HOST)" SSH_PORT="$(SSH_PORT)" REUSE="$(REUSE)" \
 		GDB="$(GDB)" SMP_IMG="$(abspath $(IMG_DIR)/hurd.kernel.smp.qcow2)" \
 		SMP_CPU_COUNT="$(SMP_CPU_COUNT)" \
 		bash scripts/run_smp_tests.sh
 
+# Boot the guest and run the virtio benchmark matrix (block, filesystem, 9pfs,
+# network).  See scripts/virtio_bench.sh and stuff/benchmark_plan.md.
+# Boots hurd.bench.qcow2 (hurdkit gnumach + fixed storeio via CUSTOM_OVERLAY).
+virtio-bench: $(IMG_DIR)/hurd.bench.qcow2 $(IMG_DIR)/hurd.bench-vnet.qcow2 $(VIRTIO_DIR)/virtio-blk $(VIRTIO_NET_DIR)/virtio-net
+	$(MKDIR_P) $(TMP_DIR)
+	SSH_HOST="$(SSH_HOST)" SSH_PORT="$(SSH_PORT)" REUSE="$(REUSE)" \
+		GDB="$(GDB)" MODE="$(MODE)" BENCH_RUNS="$(BENCH_RUNS)" \
+		BENCH_JSON="$(BENCH_JSON)" RAM_MB="2048" \
+		BASE_IMG="$(abspath $(IMG_DIR)/hurd.bench.qcow2)" \
+		VIRTIO_DIR="$(VIRTIO_DIR)" VIRTIO_NET_DIR="$(VIRTIO_NET_DIR)" \
+		VIRTIO_9P_BIN="$(VIRTIO_DIR)/virtio-9p" \
+		VIRTIO_BLK_BIN="$(VIRTIO_DIR)/virtio-blk" \
+		VBLK_CLIENT_BIN="$(VIRTIO_DIR)/vblk-client" \
+		VIRTIO_NET_BIN="$(VIRTIO_NET_DIR)/virtio-net" \
+		VIRTIO_NET_CLIENT_BIN="$(VIRTIO_NET_DIR)/vnet-client" \
+		NINEPFS_BIN="$(REPO_ROOT)/3p/9pfs/9pfs" \
+		bash scripts/virtio_bench.sh
+
 run-up-tests:
+	@if [ ! -f "$(IMG_DIR)/hurd.kernel.up.qcow2" ]; then \
+		echo "run-up-tests: missing $(IMG_DIR)/hurd.kernel.up.qcow2" >&2; \
+		echo "  build it with: make up-image" >&2; exit 1; \
+	fi
 	$(MKDIR_P) $(TMP_DIR)
 	SSH_HOST="$(SSH_HOST)" SSH_PORT="$(SSH_PORT)" REUSE="$(REUSE)" \
 		GDB="$(GDB)" SMP_IMG="$(abspath $(IMG_DIR)/hurd.kernel.up.qcow2)" \
@@ -386,6 +582,15 @@ run-up-tests:
 		SMP_UP=1 \
 		bash scripts/run_smp_tests.sh
 verify-vm: fetch-3p    ; $(MAKE) -C toolchain verify-vm
+
+# Print resolved configuration values useful for debugging.
+print-config:
+	@echo "BUILD=$(BUILD)"
+	@echo "VIRTIO_DIR=$(VIRTIO_DIR)"
+	@echo "VIRTIO_NET_DIR=$(VIRTIO_NET_DIR)"
+	@echo "IMG_DIR=$(IMG_DIR)"
+	@echo "TEST_IMG=$(TEST_IMG)"
+	@echo "SSH_PORT=$(SSH_PORT)"
 
 # Remove temporary overlay images
 clean:
@@ -395,6 +600,14 @@ clean:
 	$(RM) $(IMG_DIR)/.repaired.*.qcow2
 	$(RM) $(IMG_DIR)/hurd.work.img
 	$(RM) $(IMG_DIR)/hurd.work.img.qcow2
+
+# Remove all generated images but keep the downloaded tarball
+clean-images:
+	$(RM) $(IMG_DIR)/*.qcow2 $(IMG_DIR)/*.img $(IMG_DIR)/.extracted
+	$(RM) -r $(TMP_DIR)
+
+# Rebuild the default image pipeline from scratch
+rebuild: clean-images all
 
 # Remove all downloaded/generated files
 distclean:

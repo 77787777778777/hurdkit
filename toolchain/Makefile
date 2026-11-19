@@ -20,10 +20,17 @@ GNUMACH_NCPUS ?= 1
 GNUMACH_NCPUS_IS_SMP := $(shell test "$(GNUMACH_NCPUS)" -gt 1 2>/dev/null && echo yes)
 GNUMACH_NCPUS_OPTION := $(if $(GNUMACH_NCPUS_IS_SMP),--enable-ncpus=$(GNUMACH_NCPUS))
 
+SSH_PORT ?= 2222
+
 BINUTILS_VER := 2.46.1
 GCC_VER      := 15.3.0
 
-.PHONY: all toolchain toolchain-clean fetch binutils gcc1 gnumach gnumach-kernel glibc gcc2 mig hurd hurd-headers libpciaccess libtrivfs libirqhelp virtio-9p virtio-balloon virtio-blk 9pfs verify-vm clean tooldir 3p-pin glibc-rebuild
+.PHONY: all toolchain toolchain-clean fetch \
+	binutils gcc1 gnumach gnumach-kernel glibc gcc2 \
+	mig hurd hurd-headers libpciaccess libtrivfs libirqhelp storeio \
+	virtio-9p virtio-balloon virtio-blk virtio-net 9pfs verify-vm \
+	clean tooldir 3p-pin glibc-rebuild \
+	virtio-clean
 
 # The verified 3p checkouts, pinned to exact SHAs (see
 # stuff/crosscompile_plan.md, "3p source pins"). The shared 3p checkout is
@@ -242,16 +249,21 @@ glibc: gnumach mig hurd-headers
 # stuff/crosscompile_plan.md), so the target tools, libraries and headers
 # resolve through the $(PREFIX)/x86_64-gnu tooldir. binutils populates
 # tooldir/bin itself; include and lib have no flat equivalent after the
-# prefix install and are created here as symlinks. Idempotent; existing
-# real directories are left alone.
+# prefix install and are created here as symlinks. The binutils install
+# already creates a real tooldir/lib (for lib/ldscripts), so a real
+# directory is merged into the prefix directory before it is replaced by
+# the symlink; leaving it in place hides glibc from gcc stage 2
+# ("cannot find crti.o", "cannot find -lc"). Idempotent.
 tooldir:
 	@mkdir -p $(PREFIX)/x86_64-gnu
-	@if [ -d $(PREFIX)/x86_64-gnu/include ] && [ ! -L $(PREFIX)/x86_64-gnu/include ]; then \
-	    echo "tooldir: leaving existing include directory"; \
-	else ln -sfnT $(PREFIX)/include $(PREFIX)/x86_64-gnu/include; fi
-	@if [ -d $(PREFIX)/x86_64-gnu/lib ] && [ ! -L $(PREFIX)/x86_64-gnu/lib ]; then \
-	    echo "tooldir: leaving existing lib directory"; \
-	else ln -sfnT $(PREFIX)/lib $(PREFIX)/x86_64-gnu/lib; fi
+	@for d in include lib; do \
+	    t=$(PREFIX)/x86_64-gnu/$$d; \
+	    if [ -d $$t ] && [ ! -L $$t ]; then \
+	        echo "tooldir: merging $$t into $(PREFIX)/$$d"; \
+	        mkdir -p $(PREFIX)/$$d && cp -a $$t/. $(PREFIX)/$$d/ && rm -rf $$t || exit 1; \
+	    fi; \
+	    ln -sfnT $(PREFIX)/$$d $$t || exit 1; \
+	done
 
 
 # Canonical cross-gnu step: rebuild and reinstall glibc once the full
@@ -427,6 +439,45 @@ libirqhelp: hurd mig
 	@echo "=== gate: libirqhelp ==="
 	ls $(PREFIX)/lib/libirqhelp.so $(PREFIX)/include/hurd/irqhelp.h >/dev/null
 
+# storeio is not installed to the prefix by the `hurd` stage, so it has its
+# own target. It builds inside a configured out-of-tree Hurd tree (a
+# standalone `make -C 3p/hurd/storeio` fails: generated headers such as
+# libstore/store.h, libnetfs/fs_S.h, version.h and libhurdbugaddr.a are
+# missing).  Libs are built in dependency order:
+#   libshouldbeinlibc -> libihash -> libiohelp -> libports -> libpager ->
+#   libfshelp -> libnetfs -> libstore -> libhurdbugaddr -> storeio.
+# The hurdkit-branch fix (commit e07e9590) fixes the --no-cache byte-to-block
+# conversion (<< instead of >>) in storeio/dev.c.
+storeio: hurd mig
+	rm -rf $(BUILD)/hurd-src $(BUILD)/hurd && \
+	cp -a $(REPO_ROOT)/3p/hurd $(BUILD)/hurd-src && \
+	cd $(BUILD)/hurd-src && \
+	sed -i -e '/^if test "x$$cross_compiling" = "xyes"; then$$/,/^fi$$/d' configure.ac && \
+	autoreconf -i && \
+	mkdir -p $(BUILD)/hurd && cd $(BUILD)/hurd && \
+	    PATH=$(PREFIX)/bin:$$PATH \
+	    CC=$(PREFIX)/bin/x86_64-gnu-gcc MIG=$(PREFIX)/bin/mig \
+	    CPPFLAGS="-I$(PREFIX)/include" LDFLAGS="-L$(PREFIX)/lib" CPATH=$(PREFIX)/include \
+	    $(BUILD)/hurd-src/configure \
+	        --host=x86_64-gnu --build=x86_64-pc-linux-gnu --prefix=$(PREFIX) \
+	        --without-parted --without-libtirpc --without-libdaemon \
+	        --without-rump --without-acpica --without-libcrypt --disable-profile && \
+	    sed -e 's/MASTER_HURD_VERSION/"$(shell sed -n "s/^package-version := //p" $(BUILD)/hurd/config.make)"/' \
+	        < $(BUILD)/hurd-src/version.h.in > $(BUILD)/hurd/version.h && \
+	    PATH=$(PREFIX)/bin:$$PATH make -C libshouldbeinlibc -j$(NPROC) && \
+	    PATH=$(PREFIX)/bin:$$PATH make -C libihash -j$(NPROC) && \
+	    PATH=$(PREFIX)/bin:$$PATH make -C libiohelp -j$(NPROC) && \
+	    PATH=$(PREFIX)/bin:$$PATH make -C libports -j$(NPROC) && \
+	    PATH=$(PREFIX)/bin:$$PATH make -C libpager -j$(NPROC) && \
+	    PATH=$(PREFIX)/bin:$$PATH make -C libfshelp -j$(NPROC) && \
+	    PATH=$(PREFIX)/bin:$$PATH make -C libnetfs -j$(NPROC) && \
+	    PATH=$(PREFIX)/bin:$$PATH make -C libstore -j$(NPROC) && \
+	    PATH=$(PREFIX)/bin:$$PATH make -C libhurdbugaddr -j$(NPROC) && \
+	    PATH=$(PREFIX)/bin:$$PATH make -C storeio storeio.static
+	@echo "=== gate: storeio ==="
+	file $(BUILD)/hurd/storeio/storeio.static
+	file $(BUILD)/hurd/storeio/storeio.static | grep -q 'for GNU/Hurd' || { echo "storeio: binary is not a GNU/Hurd ELF" >&2; exit 1; }
+
 # 9pfs calls two RPC stubs directly: exec_exec_paths (file-exec-paths.c,
 # from libhurduser) and mach_port_move_member (io-reauthenticate.c, from
 # libmachuser). libc NEEDs both DSOs, so the loader finds them at run time;
@@ -452,10 +503,9 @@ libirqhelp: hurd mig
 # 3p/hurd later); they link the cross prefix like 9pfs, plus libtrivfs and
 # libpciaccess, and stay uncommitted to the 3p trees.  VIRTIO_DIR selects
 # which checkout is built, so a workbranch can be tested in place.
-VIRTIO_DIR ?= $(HOME)/src/virtio
+VIRTIO_DIR ?= $(HOME)/src/virtio-1
 
 virtio-9p: hurd libpciaccess libtrivfs libirqhelp
-	$(MAKE) -C $(VIRTIO_DIR) clean
 	$(MAKE) -C $(VIRTIO_DIR) \
 	    PATH=$(PREFIX)/bin:$$PATH \
 	    CC=$(PREFIX)/bin/x86_64-gnu-gcc \
@@ -468,7 +518,6 @@ virtio-9p: hurd libpciaccess libtrivfs libirqhelp
 # daemons in one pass, so this reuses the same invocation and gates on the
 # balloon binary.
 virtio-balloon: hurd libpciaccess libirqhelp
-	$(MAKE) -C $(VIRTIO_DIR) clean
 	$(MAKE) -C $(VIRTIO_DIR) \
 	    PATH=$(PREFIX)/bin:$$PATH \
 	    CC=$(PREFIX)/bin/x86_64-gnu-gcc \
@@ -483,7 +532,6 @@ virtio-balloon: hurd libpciaccess libirqhelp
 # Mach device translator) and vblk-client (the direct-RPC harness
 # client).
 virtio-blk: hurd libpciaccess libirqhelp
-	$(MAKE) -C $(VIRTIO_DIR) clean
 	$(MAKE) -C $(VIRTIO_DIR) \
 	    PATH=$(PREFIX)/bin:$$PATH \
 	    CC=$(PREFIX)/bin/x86_64-gnu-gcc \
@@ -493,19 +541,37 @@ virtio-blk: hurd libpciaccess libirqhelp
 	file $(VIRTIO_DIR)/virtio-blk
 	file $(VIRTIO_DIR)/vblk-client
 
+# Same build and gate shape as virtio-blk: the repo Makefile's default
+# target already builds the net driver, so this names the binary the
+# network harness installs: virtio-net (raw datapath + Mach device
+# translator).
+virtio-net: hurd libpciaccess libirqhelp
+	$(MAKE) -C $(VIRTIO_DIR) \
+	    PATH=$(PREFIX)/bin:$$PATH \
+	    CC=$(PREFIX)/bin/x86_64-gnu-gcc \
+	    CPATH=$(PREFIX)/include \
+	    LIBS="shouldbeinlibc ihash ports iohelp fshelp trivfs pciaccess hurduser machuser irqhelp"
+	@echo "=== gate: virtio-net ==="
+	file $(VIRTIO_DIR)/virtio-net
+	file $(VIRTIO_DIR)/vnet-client
+
+# Clean the virtio driver build artifacts in VIRTIO_DIR.
+virtio-clean:
+	$(MAKE) -C $(VIRTIO_DIR) clean
+
 verify-vm: 9pfs
 	@echo "=== V2: ELF check ==="
 	file $(REPO_ROOT)/3p/9pfs/9pfs
 	$(PREFIX)/bin/x86_64-gnu-readelf -h $(REPO_ROOT)/3p/9pfs/9pfs | sed -n '1,12p'
 	@echo "=== V3: install into VM ==="
-	scp -P 2222 -i $(REPO_ROOT)/img/keys/root_ed25519 -o StrictHostKeyChecking=accept-new \
+	scp -P $(SSH_PORT) -i $(REPO_ROOT)/img/keys/root_ed25519 -o StrictHostKeyChecking=accept-new \
 	    $(REPO_ROOT)/3p/9pfs/9pfs root@127.0.0.1:/tmp/9pfs
-	ssh -p 2222 -i $(REPO_ROOT)/img/keys/root_ed25519 -o StrictHostKeyChecking=accept-new \
+	ssh -p $(SSH_PORT) -i $(REPO_ROOT)/img/keys/root_ed25519 -o StrictHostKeyChecking=accept-new \
 	    root@127.0.0.1 'file /tmp/9pfs && chmod 755 /tmp/9pfs'
 	@echo "=== V4: smoke test ==="
-	ssh -p 2222 -i $(REPO_ROOT)/img/keys/root_ed25519 -o StrictHostKeyChecking=accept-new \
+	ssh -p $(SSH_PORT) -i $(REPO_ROOT)/img/keys/root_ed25519 -o StrictHostKeyChecking=accept-new \
 	    root@127.0.0.1 '/tmp/9pfs --version'
-	ssh -p 2222 -i $(REPO_ROOT)/img/keys/root_ed25519 -o StrictHostKeyChecking=accept-new \
+	ssh -p $(SSH_PORT) -i $(REPO_ROOT)/img/keys/root_ed25519 -o StrictHostKeyChecking=accept-new \
 	    root@127.0.0.1 '/tmp/9pfs --help; echo EXIT=$$?'
 
 clean:

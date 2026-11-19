@@ -213,6 +213,53 @@ This exposed the per-request server trace (`demux id`, `open`, `read
 recnum ...`) and made the difference between "client-side EIO" and
 "server-side silence" visible.
 
+- `settrans <node>` print mode returns `Device or resource busy` (rc=5)
+  and prints nothing when a translator is already active on the node;
+  empty output therefore does **not** mean "no translator". Use
+  `fsysopts <node>` to print the active translator spec, and
+  `ps -ef | awk '/virtio-net --serve/ && !/awk/ {print $2}'` to confirm
+  the process (plain `ps` drops detached daemons on this guest).
+
+## One-shot harness outside `make virtio-net-test`
+
+When the matrix doesn't cover a flag combination or an opt-in default,
+boot a throwaway guest with the shared scaffolding instead of repeating
+`qemu-system` by hand:
+
+```sh
+source scripts/virtio_boot_lib.sh
+vt_make_overlay
+vt_boot -netdev "user,id=vnet0" \
+    -device "virtio-net-pci,netdev=vnet0,disable-legacy=off${VNET_ADDR:+,addr=$VNET_ADDR}"
+```
+
+Contract details:
+
+- Pass `SSH_PORT` explicitly (the default may collide with another guest;
+  start at `SSH_PORT=4444` and count up — 4445, 4446, ... — until a port
+  binds cleanly).
+- Install cross-built binaries into the guest:
+  `ssh ... "install -m 755 /dev/stdin /hurd/virtio-net" < virtio-net`
+- Serve through a stderr-capturing wrapper: under `settrans -c` detached
+  a translator's stderr reaches neither the serial log nor SSH, so a
+  silent bring-up failure looks like a node answering `bad request
+  message ID`:
+
+      #!/bin/sh
+      exec /hurd/virtio-net --serve "$@" 2>>/tmp/serve.log
+
+- Check the active translator with `fsysopts <node>`, not `settrans -p
+  <node>`: the latter returns rc=5 "Device or resource busy" when a
+  translator is already active — empty output does **not** mean "none".
+- Confirm the process with `ps -ef | awk '/name/ && !/awk/ {print $2}'`;
+  plain `ps` drops detached daemons on this guest.
+- `vt_cleanup` leaves QEMU running on failure (inspect via
+  `ssh -i $SSH_KEY -p $SSH_PORT root@$SSH_HOST` and `$VT_QEMU_LOG`) and
+  kills it on success; `FAILED=0` defaults, set `FAILED=1` on any
+  assertion.
+- Delete any scratch scripts after the run so `git status` shows only
+  the source change you intended to keep.
+
 ## Storeio --no-cache byte-to-block sign error (virtio-blk Stage C lesson)
 
 The first storeio read through a translator succeeded; every subsequent
