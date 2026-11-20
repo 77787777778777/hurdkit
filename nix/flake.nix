@@ -36,6 +36,7 @@
             openssh # ssh, scp, ssh-keygen
             (python3.withPackages (ps: [ ps.pexpect ])) # scripts/provision_guest.py
             git
+            jq # compare the goonix pins in tests/goonix-pin.t
             gawk
             gnused
             gnugrep
